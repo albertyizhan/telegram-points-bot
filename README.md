@@ -11,8 +11,8 @@
 需要 Python 3.9+。在服务器执行以下安装命令（项目会从 GitHub 拉取）：
 
 ```bash
-git clone https://github.com/albertyizhan/telegram_points_bot.git
-cd telegram_points_bot
+git clone git@github.com:albertyizhan/telegram-points-bot.git
+cd telegram-points-bot
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 cp .env.example .env
