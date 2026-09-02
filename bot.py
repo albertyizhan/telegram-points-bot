@@ -31,9 +31,9 @@ TIMEZONE_LABELS = {
 DEFAULTS = {"checkin": ["签到", "/checkin"], "score": ["/score"], "addpoints": ["/addpoints"], "subpoints": ["/subpoints"]}
 DEFAULTS.update({"rank": ["/rank"], "today": ["/today"]})
 SETTING_LABELS = {
-    "min_chars": ("最低消息长度（达到后获得聊天积分）", "Minimum message length (for chat points)"),
-    "daily_limit": ("每日聊天积分上限（0 表示不限）", "Daily chat points limit (0 = unlimited)"),
-    "checkin_points": ("每日签到奖励积分", "Daily check-in reward"),
+    "min_chars": ("最低消息长度", "Minimum message length"),
+    "daily_limit": ("每日聊天上限", "Daily chat limit"),
+    "checkin_points": ("签到奖励", "Check-in reward"),
 }
 DB_PATH = os.getenv("DB_PATH", "points.db")
 OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
@@ -321,7 +321,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def activate(update, context):
     m=update.effective_message
-    if update.effective_chat.type == "private": return await m.reply_text("请在群内激活。")
+    if update.effective_chat.type == "private": return await m.reply_text("请在群组中使用 /activate 激活。")
     if update.effective_user.id == OWNER_ID:
         code = context.args[0] if context.args else None
         ok=store.authorize(update.effective_chat.id,update.effective_chat.title or str(update.effective_chat.id),code,update.effective_user.id,owner=True)
@@ -397,11 +397,6 @@ async def group_keyboard(update, owner=False, page=0):
     visible = all_chats[page * page_size:(page + 1) * page_size]
     for c in visible:
         rows.append([InlineKeyboardButton(c["title"],callback_data=f"g:{c['chat_id']}")])
-        if c["enabled"]:
-            rows.append([
-                InlineKeyboardButton("切换语言 / Language", callback_data=f"lang:{c['chat_id']}:toggle"),
-                InlineKeyboardButton("设置每日结算时区 / Daily reset", callback_data=f"tzlist:{c['chat_id']}"),
-            ])
     if not rows: rows.append([InlineKeyboardButton("暂无可管理群组",callback_data="noop")])
     if page_count > 1:
         nav=[]
@@ -410,7 +405,7 @@ async def group_keyboard(update, owner=False, page=0):
         if page + 1 < page_count: nav.append(InlineKeyboardButton("下一页",callback_data=f"home:{page+1}"))
         rows.append(nav)
     if owner:
-        rows.append([InlineKeyboardButton("按名称或 ID 查找群组",callback_data="ownersearch")])
+        rows.append([InlineKeyboardButton("查找群组",callback_data="ownersearch")])
         rows.append([InlineKeyboardButton("返回上一级",callback_data="home")])
     return InlineKeyboardMarkup(rows)
 
@@ -425,12 +420,30 @@ def owner_authorized_keyboard(page=0):
         nav.append(InlineKeyboardButton(f"{page+1}/{pages}",callback_data="noop"))
         if page+1<pages: nav.append(InlineKeyboardButton("下一页",callback_data=f"owner_auth_page:{page+1}"))
         rows.append(nav)
-    rows.append([InlineKeyboardButton("查找要停用的群组",callback_data="ownersearch_auth"),InlineKeyboardButton("返回上一级",callback_data="home")])
+    rows.append([InlineKeyboardButton("查找群组",callback_data="ownersearch_auth"),InlineKeyboardButton("返回上一级",callback_data="home")])
     return InlineKeyboardMarkup(rows)
 
 
 def owner_home_keyboard():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("管理我负责的群组",callback_data="ownergroups")],[InlineKeyboardButton("停用或查看已激活群组",callback_data="ownerauthorized")],[InlineKeyboardButton("生成群组激活码",callback_data="code"),InlineKeyboardButton("查看未使用激活码",callback_data="codes")]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("我的群组",callback_data="ownergroups")],[InlineKeyboardButton("已激活群组",callback_data="ownerauthorized")],[InlineKeyboardButton("生成激活码",callback_data="code"),InlineKeyboardButton("激活码列表",callback_data="codes")]])
+
+
+async def group_page(update, chat_id):
+    level=await admin_level(update,chat_id)
+    if level < 1: return None
+    uid=update.effective_user.id; english=store.settings(chat_id)["language"] == "en"; label=lambda zh,en: en if english else zh
+    if english:
+        kb=[[InlineKeyboardButton("Member points",callback_data=f"search:{chat_id}")],[InlineKeyboardButton("Today's ranking",callback_data=f"stat:{chat_id}:1")],[InlineKeyboardButton("All-time ranking",callback_data=f"stat:{chat_id}:0")]]
+    else:
+        kb=[[InlineKeyboardButton("成员积分",callback_data=f"search:{chat_id}")],[InlineKeyboardButton("今日排名",callback_data=f"stat:{chat_id}:1")],[InlineKeyboardButton("累计排名",callback_data=f"stat:{chat_id}:0")]]
+    if level >= 2:
+        kb.append([InlineKeyboardButton(label("积分规则","Point rules"),callback_data=f"set:{chat_id}")])
+        kb.append([InlineKeyboardButton(label("自定义命令","Custom commands"),callback_data=f"alias:{chat_id}")])
+    if level >= 2:
+        kb.append([InlineKeyboardButton(label("语言","Language"),callback_data=f"lang:{chat_id}:{'zh' if english else 'en'}"),InlineKeyboardButton(label("地区","Timezone"),callback_data=f"tzlist:{chat_id}")])
+    if uid == OWNER_ID and store.authorized(chat_id): kb.append([InlineKeyboardButton(label("停用积分","Deactivate points"),callback_data=f"revokeask:{chat_id}")])
+    kb.append([InlineKeyboardButton(label("返回群组列表","Back to groups"),callback_data="home")])
+    return label("群组主页","Group home"), InlineKeyboardMarkup(kb)
 
 
 async def callback(update, context):
@@ -444,10 +457,10 @@ async def callback(update, context):
         required = 2 if data.startswith(("set:","edit:","alias:","addalias:","delalias:","lang:","tz:","tzlist:")) else 1
         if not await is_admin(update, protected_chat, required): return await q.edit_message_text("权限不足或权限已变化，操作取消。")
     if data.startswith("home:"):
-        return await q.edit_message_text("群组管理",reply_markup=await group_keyboard(update,uid==OWNER_ID,int(data.split(":",1)[1])))
+        return await q.edit_message_text("选择群组",reply_markup=await group_keyboard(update,uid==OWNER_ID,int(data.split(":",1)[1])))
     if data == "ownergroups":
         if uid != OWNER_ID: return await q.edit_message_text("只有拥有者可以操作。")
-        return await q.edit_message_text("我负责的群组：选择要管理的群组",reply_markup=await group_keyboard(update,True))
+        return await q.edit_message_text("我的群组",reply_markup=await group_keyboard(update,True))
     if data == "ownerauthorized":
         if uid != OWNER_ID: return await q.edit_message_text("只有拥有者可以操作。")
         return await q.edit_message_text("已激活群组：选择要停用的群组",reply_markup=owner_authorized_keyboard(0))
@@ -469,23 +482,11 @@ async def callback(update, context):
         if uid!=OWNER_ID:return
         rows=store.unused_codes(); return await q.edit_message_text("尚未使用的群组激活码：\n"+("\n".join(f"{r['hash']} ({r['created_at']})" for r in rows) if rows else "无"))
     if data.startswith("g:"):
-        cid=int(data[2:]);
-        level=await admin_level(update,cid)
-        if level < 1: return await q.edit_message_text("权限已变化，请重新进入。")
+        cid=int(data[2:]); page=await group_page(update,cid)
+        if not page: return await q.edit_message_text("权限已变化，请重新进入。")
         context.user_data["chat_id"]=cid
-        english=store.settings(cid)["language"] == "en"; label=lambda zh,en: en if english else zh
-        if english:
-            kb=[[InlineKeyboardButton("Find and adjust member points",callback_data=f"search:{cid}")],[InlineKeyboardButton("View today's points summary",callback_data=f"stat:{cid}:1")],[InlineKeyboardButton("View all-time points summary",callback_data=f"stat:{cid}:0")]]
-        else:
-            kb=[[InlineKeyboardButton("查找成员并调整积分",callback_data=f"search:{cid}"),InlineKeyboardButton("查看今日积分统计",callback_data=f"stat:{cid}:1")],[InlineKeyboardButton("查看累计积分统计",callback_data=f"stat:{cid}:0")]]
-        if level >= 2:
-            kb.append([InlineKeyboardButton(label("设置积分规则和显示方式","Set points rules and display"),callback_data=f"set:{cid}")])
-            kb.append([InlineKeyboardButton(label("管理自定义命令名称","Manage custom command names"),callback_data=f"alias:{cid}")])
-        kb.append([InlineKeyboardButton(label("切换界面语言","Switch interface language"),callback_data=f"lang:{cid}:{'zh' if english else 'en'}"),InlineKeyboardButton(label("设置每日结算时区","Set daily reset timezone"),callback_data=f"tzlist:{cid}")])
-        if uid == OWNER_ID and store.authorized(cid): kb.append([InlineKeyboardButton(label("停用本群积分功能","Deactivate points for this group"),callback_data=f"revokeask:{cid}")])
-        kb.append([InlineKeyboardButton(label("返回群组列表","Back to group list"),callback_data="home")])
-        return await q.edit_message_text(label("群组管理：选择功能","Group management: choose an action"),reply_markup=InlineKeyboardMarkup(kb))
-    if data=="home": return await q.edit_message_text("总管理员：管理群组和激活权限" if uid==OWNER_ID else "群组管理",reply_markup=owner_home_keyboard() if uid==OWNER_ID else await group_keyboard(update,False))
+        return await q.edit_message_text(page[0],reply_markup=page[1])
+    if data=="home": return await q.edit_message_text("总管理员" if uid==OWNER_ID else "选择群组",reply_markup=owner_home_keyboard() if uid==OWNER_ID else await group_keyboard(update,False))
     if data.startswith("search:"):
         cid=int(data[7:]); context.user_data["state"]="search"; context.user_data["chat_id"]=cid; return await q.edit_message_text(tr(cid,"请输入完整数字 Telegram ID：","Enter the full numeric Telegram ID:"))
     if data.startswith("member:"):
@@ -518,13 +519,13 @@ async def callback(update, context):
     if data.startswith("lang:"):
         _,cs,language=data.split(":"); cid=int(cs)
         if language == "toggle": language="en" if store.settings(cid)["language"] == "zh" else "zh"
-        store.set_language(cid,language); return await settings_page(q,cid)
+        store.set_language(cid,language); page=await group_page(update,cid); return await q.edit_message_text(page[0],reply_markup=page[1])
     if data.startswith("tz:"):
-        _,cs,timezone=data.split(":",2); cid=int(cs); store.set_timezone(cid,timezone); return await settings_page(q,cid)
+        _,cs,timezone=data.split(":",2); cid=int(cs); store.set_timezone(cid,timezone); page=await group_page(update,cid); return await q.edit_message_text(page[0],reply_markup=page[1])
     if data.startswith("tzlist:"):
         cid=int(data.split(":",1)[1]); s=store.settings(cid); english=s["language"] == "en"
         rows=[[InlineKeyboardButton(TIMEZONE_LABELS[z][1 if english else 0],callback_data=f"tz:{cid}:{z}")] for z in TIMEZONE_OPTIONS]
-        rows.append([InlineKeyboardButton("Back to settings" if english else "返回规则设置",callback_data=f"set:{cid}")])
+        rows.append([InlineKeyboardButton("Back to group" if english else "返回群组",callback_data=f"g:{cid}")])
         return await q.edit_message_text("Choose the timezone used for daily reset" if english else "选择每日积分结算使用的时区",reply_markup=InlineKeyboardMarkup(rows))
     if data.startswith("edit:"):
         _,cs,key=data.split(":"); cs=int(cs); context.user_data["state"]="setting"; context.user_data["edit"]=(cs,key); return await q.edit_message_text(tr(cs,"请输入新的数值（填 0 表示不限制）：","Enter a new value (0 means unlimited):"))
@@ -543,7 +544,7 @@ async def callback(update, context):
     if data.startswith("addalias:"):
         cid=int(data[9:]); context.user_data["state"]="alias"; context.user_data["chat_id"]=cid; return await q.edit_message_text(tr(cid,"请输入：功能名称 自定义命令，例如 score /积分；群成员之后可发送 /积分 查看积分。","Enter: function name and shortcut, e.g. score /points; members can then use /points to view scores."))
     if data.startswith("delalias:"):
-        _,cs,alias=data.split(":",2); cid=int(cs); store.remove_alias(cid,alias); english=store.settings(cid)["language"] == "en"; return await q.edit_message_text("Alias deleted." if english else "别名已删除。",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back to aliases" if english else "返回别名",callback_data=f"alias:{cs}")]]))
+        _,cs,alias=data.split(":",2); cid=int(cs); store.remove_alias(cid,alias); english=store.settings(cid)["language"] == "en"; return await q.edit_message_text("Command shortcut removed." if english else "自定义命令已删除。",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back to shortcuts" if english else "返回自定义命令",callback_data=f"alias:{cs}")]]))
     if data.startswith("revokeask:"):
         if uid!=OWNER_ID:return
         parts=data.split(":"); cid=int(parts[1]); owner_list=len(parts)>2 and parts[2]=="owner"; chat=store.conn.execute("SELECT title,enabled FROM chats WHERE chat_id=?",(cid,)).fetchone()
@@ -573,14 +574,11 @@ async def member_page(q, context, cid, uid, notice=""):
 
 async def settings_page(q, cid):
     s=store.settings(cid); english=s["language"] == "en"; labels={k:v[1 if english else 0] for k,v in SETTING_LABELS.items()}
-    title="Group settings" if english else "群组设置"
+    title="Point rules" if english else "积分规则"
     min_value = "No minimum" if english and s["min_chars"] == 0 else ("不限" if s["min_chars"] == 0 else str(s["min_chars"]))
     limit_value = "Unlimited" if english and s["daily_limit"] == 0 else ("不限" if s["daily_limit"] == 0 else str(s["daily_limit"]))
-    language_label = "Language: English" if english else "语言：中文"
-    timezone_label = TIMEZONE_LABELS.get(s["timezone"], (s["timezone"], s["timezone"]))[1 if english else 0]
-    body=f"{labels['min_chars']}: {min_value}\n{labels['daily_limit']}: {limit_value}\n{labels['checkin_points']}: {s['checkin_points']}\n{language_label}\n{'Timezone' if english else '时区'}: {timezone_label}"
-    lang_to="zh" if english else "en"; lang_label="中文" if english else "English"
-    rows=[[InlineKeyboardButton(labels['min_chars'],callback_data=f"edit:{cid}:min_chars")],[InlineKeyboardButton(labels['daily_limit'],callback_data=f"edit:{cid}:daily_limit")],[InlineKeyboardButton(labels['checkin_points'],callback_data=f"edit:{cid}:checkin_points")],[InlineKeyboardButton(lang_label,callback_data=f"lang:{cid}:{lang_to}")],[InlineKeyboardButton("Set daily reset timezone" if english else "设置每日结算时区",callback_data=f"tzlist:{cid}")],[InlineKeyboardButton("Back to group" if english else "返回群组",callback_data=f"g:{cid}")]]
+    body=f"{labels['min_chars']}: {min_value}\n{labels['daily_limit']}: {limit_value}\n{labels['checkin_points']}: {s['checkin_points']}"
+    rows=[[InlineKeyboardButton(labels['min_chars'],callback_data=f"edit:{cid}:min_chars")],[InlineKeyboardButton(labels['daily_limit'],callback_data=f"edit:{cid}:daily_limit")],[InlineKeyboardButton(labels['checkin_points'],callback_data=f"edit:{cid}:checkin_points")],[InlineKeyboardButton("Back to group" if english else "返回群组",callback_data=f"g:{cid}")]]
     return await q.edit_message_text(title+"\n\n"+body,reply_markup=InlineKeyboardMarkup(rows))
 
 
@@ -597,7 +595,7 @@ async def private_text(update, context):
         if not rows: return await update.effective_message.reply_text("没有找到匹配的群组。",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("返回群组列表",callback_data="home:0")]]))
         keyboard=[]
         for r in rows[:20]:
-            status=" [已撤销]" if not r["enabled"] else ""
+            status=" [已停用]" if not r["enabled"] else ""
             keyboard.append([InlineKeyboardButton(r["title"]+status,callback_data=f"g:{r['chat_id']}")])
         keyboard.append([InlineKeyboardButton("返回群组列表",callback_data="home:0")])
         return await update.effective_message.reply_text(f"找到 {len(rows)} 个群组：",reply_markup=InlineKeyboardMarkup(keyboard))
