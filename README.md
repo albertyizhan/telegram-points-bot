@@ -92,3 +92,4 @@ chmod +x start.sh
 ```
 
 测试直接覆盖 SQLite 规则，不访问 Telegram 网络。
+# telegram-points-bot
