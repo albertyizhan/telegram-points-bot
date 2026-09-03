@@ -11,11 +11,10 @@ git clone git@github.com:albertyizhan/telegram-points-bot.git
 cd telegram-points-bot
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
-cp .env.example .env
 chmod +x manage.sh
 ```
 
-编辑 `.env`：
+第一次运行 `./manage.sh start` 会自动生成本地 `.env`。编辑它：
 
 ```dotenv
 BOT_TOKEN=从 BotFather 获取的 Token

@@ -25,7 +25,12 @@ EOF
 
 load_env() {
   [[ -x "$PYTHON" ]] || { echo "未找到 .venv，请先完成安装。" >&2; exit 1; }
-  [[ -f "$ROOT/.env" ]] || { echo "未找到 .env，请先复制 .env.example 并填写配置。" >&2; exit 1; }
+  if [[ ! -f "$ROOT/.env" ]]; then
+    cp "$ROOT/.env.example" "$ROOT/.env"
+    chmod 600 "$ROOT/.env"
+    echo "已生成 .env，请填写 BOT_TOKEN 和 OWNER_ID 后重新运行。" >&2
+    exit 1
+  fi
   set -a
   . "$ROOT/.env"
   set +a
