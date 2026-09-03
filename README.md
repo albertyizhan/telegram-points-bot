@@ -12,7 +12,7 @@ cd telegram-points-bot
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 cp .env.example .env
-chmod +x start.sh
+chmod +x manage.sh
 ```
 
 编辑 `.env`：
@@ -23,13 +23,17 @@ OWNER_ID=总管理员的 Telegram 数字 ID
 # DB_PATH=points.db
 ```
 
-启动：
+启动和管理：
 
 ```bash
-./start.sh
+./manage.sh start       # 后台启动
+./manage.sh status      # 查看状态和最近日志
+./manage.sh stop        # 正常关闭
+./manage.sh restart     # 重启
+./manage.sh update      # 拉取 GitHub 更新、安装依赖并重启
 ```
 
-脚本会自动进入项目目录、读取 `.env`，并以前台进程运行机器人，适合交给 systemd 或 Supervisor 托管。
+`manage.sh` 会自动进入项目目录并读取 `.env`。`run` 命令可前台运行用于调试；进程卡住时使用 `./manage.sh stop --force`。
 
 ## 2. 激活群组
 
@@ -75,10 +79,6 @@ OWNER_ID=总管理员的 Telegram 数字 ID
 - 积分调整记录
 
 语言和时区按群组分别保存。每日结算时区会影响签到和每日聊天积分上限的日期边界。
-
-## 5. 备份责任
-
-机器人不提供服务器端导出或导入。每个群主自行保存本群资料。数据库默认是项目目录下的 `points.db`，也可以通过 `DB_PATH` 指定其他位置。
 
 ## 测试
 
