@@ -35,6 +35,8 @@ OWNER_ID=总管理员的 Telegram 数字 ID
 
 `manage.sh` 会自动进入项目目录并读取 `.env`。`run` 命令可前台运行用于调试；进程卡住时使用 `./manage.sh stop --force`。
 
+数据库使用 SQLite，已启用 WAL、正常同步和写入等待，适合每天几千条群消息的小型服务。请使用 `./manage.sh stop` 正常关闭后再复制或迁移数据库；不要单独复制 `points.db-wal` 或 `points.db-shm` 文件。
+
 ## 2. 激活群组
 
 1. 总管理员私聊机器人发送 `/start`，点击“生成群组激活码”。

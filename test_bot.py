@@ -116,4 +116,12 @@ class PointsTests(unittest.TestCase):
         self.s.award_chat(-1, 1, "u1", "User 1", "hello")
         daily,total_daily=self.s.ranking(-1,True,0,15); self.assertEqual(total_daily,1); self.assertEqual(daily[0]["user_id"],1)
 
+    def test_high_volume_messages_respect_daily_limit(self):
+        self.s.set_setting(-1, "min_chars", 1)
+        self.s.set_setting(-1, "daily_limit", 1000)
+        for _ in range(1000):
+            self.assertEqual(self.s.award_chat(-1, 42, "busy", "Busy", "x"), 1)
+        self.assertEqual(self.s.award_chat(-1, 42, "busy", "Busy", "x"), 0)
+        self.assertEqual(self.s.score(-1, 42)[:2], (1000, 1000))
+
 if __name__ == "__main__": unittest.main()

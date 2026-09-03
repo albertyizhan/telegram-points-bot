@@ -88,10 +88,12 @@ def tr_error(chat_id, message):
 
 class Store:
     def __init__(self, path=DB_PATH):
-        self.conn = sqlite3.connect(path, check_same_thread=False)
+        self.conn = sqlite3.connect(path, timeout=30, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute("PRAGMA busy_timeout=30000")
         self.init()
 
     def init(self):
@@ -117,6 +119,13 @@ class Store:
             self.conn.execute("INSERT OR IGNORE INTO settings(chat_id) SELECT chat_id FROM chats")
             self.conn.execute("INSERT OR IGNORE INTO licenses(user_id,code_hash,bound_at) SELECT used_by,code_hash,COALESCE(used_at,created_at) FROM auth_codes WHERE used_by IS NOT NULL")
             self.conn.execute("UPDATE chats SET authorized_by=(SELECT used_by FROM auth_codes WHERE used_chat_id=chats.chat_id AND used_by IS NOT NULL ORDER BY used_at LIMIT 1) WHERE authorized_by IS NULL")
+            self.conn.executescript("""
+            CREATE INDEX IF NOT EXISTS idx_daily_chat_day_user ON daily(chat_id, day, user_id);
+            CREATE INDEX IF NOT EXISTS idx_users_chat_username ON users(chat_id, lower(username));
+            CREATE INDEX IF NOT EXISTS idx_adjustments_chat_target_id ON adjustments(chat_id, target_id, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_chats_enabled_authorized ON chats(enabled, authorized_by);
+            CREATE INDEX IF NOT EXISTS idx_aliases_chat_alias ON aliases(chat_id, lower(alias));
+            """)
 
     def close(self): self.conn.close()
 
@@ -215,31 +224,36 @@ class Store:
     def aliases(self, chat_id): return self.conn.execute("SELECT action,alias FROM aliases WHERE chat_id=? ORDER BY action,alias", (chat_id,)).fetchall()
 
     def award_chat(self, chat_id, user_id, username, display_name, text):
-        if not self.authorized(chat_id): return 0
-        s = self.settings(chat_id); count = len(re.sub(r"\s", "", text, flags=re.UNICODE))
-        self.upsert_user(chat_id,user_id,username,display_name)
+        s = self.conn.execute("SELECT c.enabled,s.min_chars,s.daily_limit,s.timezone FROM chats c JOIN settings s ON s.chat_id=c.chat_id WHERE c.chat_id=?", (chat_id,)).fetchone()
+        if not s or not s[0]: return 0
+        count = len(re.sub(r"\s", "", text, flags=re.UNICODE))
         if not count or (s["min_chars"] and count < s["min_chars"]): return 0
-        current_day = self.local_day(chat_id)
+        current_day = day(s["timezone"])
+        timestamp = now(s["timezone"])
         with db_lock, self.conn:
+            self.conn.execute("INSERT INTO users(chat_id,user_id,username,display_name,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(chat_id,user_id) DO UPDATE SET username=excluded.username,display_name=excluded.display_name,updated_at=excluded.updated_at", (chat_id,user_id,username,display_name,timestamp))
             self.conn.execute("INSERT INTO daily(chat_id,user_id,day) VALUES(?,?,?) ON CONFLICT DO NOTHING", (chat_id,user_id,current_day))
-            r = self.conn.execute("SELECT chat_points FROM daily WHERE chat_id=? AND user_id=? AND day=?", (chat_id,user_id,current_day)).fetchone()
-            add = 1 if s["daily_limit"] == 0 else min(1, max(0, s["daily_limit"] - r[0]))
-            if add:
-                self.conn.execute("UPDATE daily SET chat_points=chat_points+? WHERE chat_id=? AND user_id=? AND day=?", (add,chat_id,user_id,current_day))
-                self.conn.execute("UPDATE users SET total_points=total_points+?,updated_at=? WHERE chat_id=? AND user_id=?", (add,self.chat_now(chat_id),chat_id,user_id))
+            if s["daily_limit"]:
+                cursor = self.conn.execute("UPDATE daily SET chat_points=chat_points+1 WHERE chat_id=? AND user_id=? AND day=? AND chat_points<?", (chat_id,user_id,current_day,s["daily_limit"]))
+            else:
+                cursor = self.conn.execute("UPDATE daily SET chat_points=chat_points+1 WHERE chat_id=? AND user_id=? AND day=?", (chat_id,user_id,current_day))
+            add = 1 if cursor.rowcount else 0
+            if add: self.conn.execute("UPDATE users SET total_points=total_points+1,updated_at=? WHERE chat_id=? AND user_id=?", (timestamp,chat_id,user_id))
             return add
 
     def checkin(self, chat_id, user_id, username, display_name):
-        if not self.authorized(chat_id): return (False,0,0)
-        self.upsert_user(chat_id,user_id,username,display_name); s=self.settings(chat_id)
-        current_day = self.local_day(chat_id)
+        s = self.conn.execute("SELECT c.enabled,s.checkin_points,s.timezone FROM chats c JOIN settings s ON s.chat_id=c.chat_id WHERE c.chat_id=?", (chat_id,)).fetchone()
+        if not s or not s[0]: return (False,0,0)
+        points = s["checkin_points"]
+        current_day = day(s["timezone"])
+        timestamp = now(s["timezone"])
         with db_lock, self.conn:
+            self.conn.execute("INSERT INTO users(chat_id,user_id,username,display_name,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(chat_id,user_id) DO UPDATE SET username=excluded.username,display_name=excluded.display_name,updated_at=excluded.updated_at", (chat_id,user_id,username,display_name,timestamp))
             self.conn.execute("INSERT INTO daily(chat_id,user_id,day) VALUES(?,?,?) ON CONFLICT DO NOTHING", (chat_id,user_id,current_day))
-            r=self.conn.execute("SELECT checked_in FROM daily WHERE chat_id=? AND user_id=? AND day=?", (chat_id,user_id,current_day)).fetchone()
-            if r[0]: return (False,0,self.total(chat_id,user_id))
-            self.conn.execute("UPDATE daily SET checked_in=1,checkin_points=? WHERE chat_id=? AND user_id=? AND day=?", (s["checkin_points"],chat_id,user_id,current_day))
-            self.conn.execute("UPDATE users SET total_points=total_points+?,updated_at=? WHERE chat_id=? AND user_id=?", (s["checkin_points"],self.chat_now(chat_id),chat_id,user_id))
-            return (True,s["checkin_points"],self.total(chat_id,user_id))
+            cursor = self.conn.execute("UPDATE daily SET checked_in=1,checkin_points=? WHERE chat_id=? AND user_id=? AND day=? AND checked_in=0", (points,chat_id,user_id,current_day))
+            if not cursor.rowcount: return (False,0,self.total(chat_id,user_id))
+            self.conn.execute("UPDATE users SET total_points=total_points+?,updated_at=? WHERE chat_id=? AND user_id=?", (points,timestamp,chat_id,user_id))
+            return (True,points,self.total(chat_id,user_id))
 
     def total(self, chat_id, user_id):
         r=self.conn.execute("SELECT total_points FROM users WHERE chat_id=? AND user_id=?", (chat_id,user_id)).fetchone(); return r[0] if r else 0
@@ -274,8 +288,9 @@ class Store:
     def ranking(self, chat_id, today=False, page=0, size=15):
         offset = max(0, page) * size
         if today:
-            rows = self.conn.execute("SELECT u.user_id,u.display_name,u.username,d.chat_points+d.checkin_points AS points FROM users u JOIN daily d ON d.chat_id=u.chat_id AND d.user_id=u.user_id WHERE u.chat_id=? AND d.day=? ORDER BY points DESC,u.user_id LIMIT ? OFFSET ?", (chat_id,self.local_day(chat_id),size,offset)).fetchall()
-            total = self.conn.execute("SELECT COUNT(*) FROM users u JOIN daily d ON d.chat_id=u.chat_id AND d.user_id=u.user_id WHERE u.chat_id=? AND d.day=?", (chat_id,self.local_day(chat_id))).fetchone()[0]
+            current_day = self.local_day(chat_id)
+            rows = self.conn.execute("SELECT u.user_id,u.display_name,u.username,d.chat_points+d.checkin_points AS points FROM users u JOIN daily d ON d.chat_id=u.chat_id AND d.user_id=u.user_id WHERE u.chat_id=? AND d.day=? ORDER BY points DESC,u.user_id LIMIT ? OFFSET ?", (chat_id,current_day,size,offset)).fetchall()
+            total = self.conn.execute("SELECT COUNT(*) FROM daily WHERE chat_id=? AND day=?", (chat_id,current_day)).fetchone()[0]
         else:
             rows = self.conn.execute("SELECT user_id,display_name,username,total_points AS points FROM users WHERE chat_id=? ORDER BY points DESC,user_id LIMIT ? OFFSET ?", (chat_id,size,offset)).fetchall()
             total = self.conn.execute("SELECT COUNT(*) FROM users WHERE chat_id=?", (chat_id,)).fetchone()[0]
@@ -307,9 +322,8 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not m or not u or u.is_bot: return
     if update.effective_chat.type == "private": return await private_text(update,context)
     cid=update.effective_chat.id
-    if not store.authorized(cid): return
-    store.upsert_user(cid,u.id,u.username,u.full_name)
     action=store.resolve_alias(cid,m.text or "")
+    if action and not store.authorized(cid): return
     if action == "checkin":
         ok,pts,total=store.checkin(cid,u.id,u.username,u.full_name)
         await m.reply_text(tr(cid, f"签到成功：+{pts} 分，当前总积分 {total}", f"Check-in successful: +{pts} points. Total: {total}") if ok else tr(cid,"今天已经签到过了","You have already checked in today."))
@@ -638,8 +652,12 @@ async def post_init(application):
         print(f"命令列表注册失败，将继续运行：{exc}")
 
 
+async def post_shutdown(application):
+    store.close()
+
+
 def build_app(token):
-    app=Application.builder().token(token).post_init(post_init).build()
+    app=Application.builder().token(token).post_init(post_init).post_shutdown(post_shutdown).build()
     app.add_handler(CommandHandler("activate",activate)); app.add_handler(CommandHandler("score",score_cmd)); app.add_handler(CommandHandler("rank",lambda u,c:rank_cmd(u,c,False))); app.add_handler(CommandHandler("today",lambda u,c:rank_cmd(u,c,True))); app.add_handler(CommandHandler("addpoints",lambda u,c:points_cmd(u,c,"addpoints"))); app.add_handler(CommandHandler("subpoints",lambda u,c:points_cmd(u,c,"subpoints"))); app.add_handler(CommandHandler("start",start)); app.add_handler(CallbackQueryHandler(callback)); app.add_handler(MessageHandler(filters.TEXT,text_handler)); return app
 
 
