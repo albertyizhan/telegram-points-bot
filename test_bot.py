@@ -108,6 +108,19 @@ class PointsTests(unittest.TestCase):
         self.s.revoke(-1); self.s.revoke(-1)
         self.assertFalse(self.s.authorized(-1)); self.assertIsNotNone(self.s.find_user(-1, "7"))
 
+    def test_adjustment_is_blocked_after_revoke(self):
+        self.s.upsert_user(-1, 7, "alice", "Alice")
+        self.s.revoke(-1)
+        with self.assertRaisesRegex(ValueError, "本群尚未激活"):
+            self.s.adjust(-1, 99, 7, 1, "后台")
+
+    def test_setting_values_are_bounded(self):
+        self.s.set_setting(-1, "daily_limit", 1000000)
+        with self.assertRaisesRegex(ValueError, "0 到 1000000"):
+            self.s.set_setting(-1, "daily_limit", 1000001)
+        with self.assertRaisesRegex(ValueError, "0 到 1000000"):
+            self.s.set_setting(-1, "daily_limit", 10**100)
+
     def test_rankings_are_paginated_and_daily_scoped(self):
         for user_id in range(1, 18): self.s.upsert_user(-1, user_id, f"u{user_id}", f"User {user_id}")
         self.s.conn.execute("UPDATE users SET total_points=user_id WHERE chat_id=-1"); self.s.conn.commit()

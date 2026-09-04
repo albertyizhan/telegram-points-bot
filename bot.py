@@ -79,6 +79,8 @@ ERROR_EN = {
     "数量必须是 1 到 1000000 的整数": "Amount must be an integer from 1 to 1,000,000.",
     "用户需要先在群里发言": "The member must speak in the group first.",
     "积分不能低于 0": "Points cannot go below 0.",
+    "本群尚未激活积分功能": "Points are not activated for this group.",
+    "设置必须是 0 到 1000000 的整数": "Settings must be an integer from 0 to 1,000,000.",
 }
 
 
@@ -178,7 +180,7 @@ class Store:
 
     def set_setting(self, chat_id, key, value):
         if key not in ("min_chars", "daily_limit", "checkin_points"): raise ValueError("invalid setting")
-        if not isinstance(value, int) or value < 0: raise ValueError("设置必须是非负整数")
+        if not isinstance(value, int) or not 0 <= value <= 1000000: raise ValueError("设置必须是 0 到 1000000 的整数")
         with self.conn: self.conn.execute(f"UPDATE settings SET {key}=? WHERE chat_id=?", (value,chat_id))
 
     def set_language(self, chat_id, language):
@@ -270,6 +272,7 @@ class Store:
 
     def adjust(self, chat_id, operator_id, target_id, delta, method):
         if not 1 <= abs(delta) <= 1000000: raise ValueError("数量必须是 1 到 1000000 的整数")
+        if not self.authorized(chat_id): raise ValueError("本群尚未激活积分功能")
         with db_lock, self.conn:
             r=self.conn.execute("SELECT total_points FROM users WHERE chat_id=? AND user_id=?", (chat_id,target_id)).fetchone()
             if not r: raise ValueError("用户需要先在群里发言")
@@ -548,7 +551,11 @@ async def callback(update, context):
         if not p:return await q.edit_message_text("该设置已处理。")
         cs,key,value=p
         if uid!=OWNER_ID and not await is_admin(update,cs,2): return await q.edit_message_text("权限不足或权限已变化，操作取消。")
-        store.set_setting(cs,key,value); english=store.settings(cs)["language"] == "en"; return await q.edit_message_text("Settings saved." if english else "设置已保存。",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back to group" if english else "返回群组",callback_data=f"g:{cs}")]]))
+        try:
+            store.set_setting(cs,key,value)
+        except ValueError as e:
+            return await q.edit_message_text(tr_error(cs, str(e)))
+        english=store.settings(cs)["language"] == "en"; return await q.edit_message_text("Settings saved." if english else "设置已保存。",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back to group" if english else "返回群组",callback_data=f"g:{cs}")]]))
     if data=="cancel_setting":
         context.user_data.pop("pending_setting",None); return await q.edit_message_text("已取消。")
     if data.startswith("alias:"):
