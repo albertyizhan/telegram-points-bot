@@ -32,7 +32,7 @@ DEFAULTS = {"checkin": ["签到", "/checkin"], "score": ["/score"], "addpoints":
 DEFAULTS.update({"rank": ["/rank"], "today": ["/today"]})
 SETTING_LABELS = {
     "min_chars": ("最低消息长度", "Minimum message length"),
-    "daily_limit": ("每日聊天上限", "Daily chat limit"),
+    "daily_limit": ("每日获取上限", "Daily chat limit"),
     "checkin_points": ("签到奖励", "Check-in reward"),
 }
 DB_PATH = os.getenv("DB_PATH", "points.db")
@@ -457,7 +457,7 @@ async def group_page(update, chat_id):
         kb.append([InlineKeyboardButton(label("积分规则","Point rules"),callback_data=f"set:{chat_id}")])
         kb.append([InlineKeyboardButton(label("自定义命令","Custom commands"),callback_data=f"alias:{chat_id}")])
     if level >= 2:
-        kb.append([InlineKeyboardButton(label("语言","Language"),callback_data=f"lang:{chat_id}:{'zh' if english else 'en'}"),InlineKeyboardButton(label("地区","Timezone"),callback_data=f"tzlist:{chat_id}")])
+        kb.append([InlineKeyboardButton(label("中文/English","中文/English"),callback_data=f"lang:{chat_id}:{'zh' if english else 'en'}"),InlineKeyboardButton(label("地区","Timezone"),callback_data=f"tzlist:{chat_id}")])
     if uid == OWNER_ID and store.authorized(chat_id): kb.append([InlineKeyboardButton(label("停用积分","Deactivate points"),callback_data=f"revokeask:{chat_id}")])
     kb.append([InlineKeyboardButton(label("返回群组列表","Back to groups"),callback_data="home")])
     return label("群组主页","Group home"), InlineKeyboardMarkup(kb)
