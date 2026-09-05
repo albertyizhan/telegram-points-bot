@@ -7,7 +7,7 @@
 服务器需要 Python 3.9+。从 GitHub 拉取并安装依赖：
 
 ```bash
-git clone git@github.com:albertyizhan/telegram-points-bot.git
+git clone https://github.com/albertyizhan/telegram-points-bot.git
 cd telegram-points-bot
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
