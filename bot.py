@@ -48,6 +48,8 @@ COMMANDS = [
     BotCommand("activate", "激活本群积分功能 / Activate points for this group"),
     BotCommand("rank", "查看群组累计积分排名 / View all-time ranking"),
     BotCommand("today", "查看今日积分排名 / View today's ranking"),
+    BotCommand("export", "导出本群数据 / Export group data"),
+    BotCommand("import", "导入 JSON 数据 / Import JSON data"),
 ]
 
 
@@ -375,6 +377,21 @@ async def activate(update, context):
     await m.reply_text("本群积分功能已激活。你绑定的激活码还可用于最多 3 个群。" if ok else ("你已有绑定激活码，请直接发送 /activate；每人最多激活 3 个群。" if not code else "激活码无效、已被其他人使用，或本群已经激活。"))
 
 
+async def export_cmd(update, context):
+    cid=update.effective_chat.id
+    if not await is_admin(update,cid): return await update.effective_message.reply_text("只有管理员可以导出群数据。")
+    from telegram import InputFile
+    import io
+    await update.effective_message.reply_document(InputFile(io.BytesIO(store.export_chat(cid).encode()), filename=f"points-{cid}.json"))
+
+async def import_cmd(update, context):
+    cid=update.effective_chat.id
+    if not await is_admin(update,cid): return await update.effective_message.reply_text("只有管理员可以导入群数据。")
+    if not context.args: return await update.effective_message.reply_text("用法：/import 后粘贴 JSON 数据。")
+    try: n=store.import_chat(cid,update.effective_user.id," ".join(context.args))
+    except Exception as e: return await update.effective_message.reply_text(f"导入失败：{e}")
+    await update.effective_message.reply_text(f"导入成功，共处理 {n} 名成员，已留下导入记录。")
+
 async def score_cmd(update, context):
     cid=update.effective_chat.id
     if not store.authorized(cid): return await update.effective_message.reply_text(tr(cid,"本群尚未激活积分功能，请先使用 /activate。","Points are not activated. Use /activate first."))
@@ -691,7 +708,7 @@ async def post_shutdown(application):
 
 def build_app(token):
     app=Application.builder().token(token).post_init(post_init).post_shutdown(post_shutdown).build()
-    app.add_handler(CommandHandler("activate",activate)); app.add_handler(CommandHandler("score",score_cmd)); app.add_handler(CommandHandler("rank",lambda u,c:rank_cmd(u,c,False))); app.add_handler(CommandHandler("today",lambda u,c:rank_cmd(u,c,True))); app.add_handler(CommandHandler("addpoints",lambda u,c:points_cmd(u,c,"addpoints"))); app.add_handler(CommandHandler("subpoints",lambda u,c:points_cmd(u,c,"subpoints"))); app.add_handler(CommandHandler("start",start)); app.add_handler(CallbackQueryHandler(callback)); app.add_handler(MessageHandler(filters.TEXT,text_handler)); return app
+    app.add_handler(CommandHandler("activate",activate)); app.add_handler(CommandHandler("export",export_cmd)); app.add_handler(CommandHandler("import",import_cmd)); app.add_handler(CommandHandler("score",score_cmd)); app.add_handler(CommandHandler("rank",lambda u,c:rank_cmd(u,c,False))); app.add_handler(CommandHandler("today",lambda u,c:rank_cmd(u,c,True))); app.add_handler(CommandHandler("addpoints",lambda u,c:points_cmd(u,c,"addpoints"))); app.add_handler(CommandHandler("subpoints",lambda u,c:points_cmd(u,c,"subpoints"))); app.add_handler(CommandHandler("start",start)); app.add_handler(CallbackQueryHandler(callback)); app.add_handler(MessageHandler(filters.TEXT,text_handler)); return app
 
 
 def main():
