@@ -48,8 +48,6 @@ COMMANDS = [
     BotCommand("activate", "激活本群积分功能 / Activate points for this group"),
     BotCommand("rank", "查看群组累计积分排名 / View all-time ranking"),
     BotCommand("today", "查看今日积分排名 / View today's ranking"),
-    BotCommand("export", "导出本群数据 / Export group data"),
-    BotCommand("import", "导入 JSON 数据 / Import JSON data"),
 ]
 
 
@@ -314,9 +312,17 @@ class Store:
     def import_chat(self, chat_id, operator_id, payload, source="json"):
         """Merge a snapshot and leave an auditable import record."""
         data = json.loads(payload) if isinstance(payload, str) else payload
-        if not isinstance(data, dict) or not isinstance(data.get("users", []), list): raise ValueError("导入文件格式无效")
+        if not isinstance(data, dict) or data.get("chat_id") != chat_id or not isinstance(data.get("users", []), list): raise ValueError("导入文件不是本群数据，已取消")
         count = 0
         with db_lock, self.conn:
+            settings = data.get("settings")
+            if isinstance(settings, dict):
+                values = [int(settings.get(key, default)) for key, default in (("min_chars", 5), ("daily_limit", 20), ("checkin_points", 5))]
+                if any(value < 0 or value > 1000000 for value in values): raise ValueError("导入文件中的设置值无效")
+                language = settings.get("language", "zh"); timezone = settings.get("timezone", DEFAULT_TIMEZONE)
+                if language not in ("zh", "en"): raise ValueError("导入文件中的语言设置无效")
+                timezone_for(timezone)
+                self.conn.execute("UPDATE settings SET min_chars=?,daily_limit=?,checkin_points=?,language=?,timezone=? WHERE chat_id=?", (*values, language, timezone, chat_id))
             for u in data["users"]:
                 uid = int(u["user_id"]); self.conn.execute("INSERT INTO users(chat_id,user_id,username,display_name,total_points,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(chat_id,user_id) DO UPDATE SET username=excluded.username,display_name=excluded.display_name,total_points=excluded.total_points,updated_at=excluded.updated_at", (chat_id,uid,u.get("username"),u.get("display_name") or str(uid),int(u.get("total_points",0)),u.get("updated_at") or self.chat_now(chat_id))); count += 1
             for d in data.get("daily", []):
@@ -377,20 +383,22 @@ async def activate(update, context):
     await m.reply_text("本群积分功能已激活。你绑定的激活码还可用于最多 3 个群。" if ok else ("你已有绑定激活码，请直接发送 /activate；每人最多激活 3 个群。" if not code else "激活码无效、已被其他人使用，或本群已经激活。"))
 
 
-async def export_cmd(update, context):
-    cid=update.effective_chat.id
-    if not await is_admin(update,cid): return await update.effective_message.reply_text("只有管理员可以导出群数据。")
-    from telegram import InputFile
-    import io
-    await update.effective_message.reply_document(InputFile(io.BytesIO(store.export_chat(cid).encode()), filename=f"points-{cid}.json"))
-
-async def import_cmd(update, context):
-    cid=update.effective_chat.id
-    if not await is_admin(update,cid): return await update.effective_message.reply_text("只有管理员可以导入群数据。")
-    if not context.args: return await update.effective_message.reply_text("用法：/import 后粘贴 JSON 数据。")
-    try: n=store.import_chat(cid,update.effective_user.id," ".join(context.args))
-    except Exception as e: return await update.effective_message.reply_text(f"导入失败：{e}")
-    await update.effective_message.reply_text(f"导入成功，共处理 {n} 名成员，已留下导入记录。")
+async def document_handler(update, context):
+    if update.effective_chat.type != "private": return
+    cid = context.user_data.get("chat_id")
+    if not cid or not await is_admin(update, cid, 2):
+        return await update.effective_message.reply_text("请先从群组管理页选择群组，再点击“导入数据”。")
+    document = update.effective_message.document
+    if not document.file_name.lower().endswith(".json"):
+        return await update.effective_message.reply_text("只支持 JSON 导入文件。")
+    try:
+        payload = (await (await document.get_file()).download_as_bytearray()).decode("utf-8")
+        count = store.import_chat(cid, update.effective_user.id, payload, "button")
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        return await update.effective_message.reply_text(f"导入失败：{exc}")
+    except Exception:
+        return await update.effective_message.reply_text("导入失败：无法读取文件。")
+    await update.effective_message.reply_text(f"导入成功，共处理 {count} 名成员，已留下导入记录。", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("查看导入记录", callback_data=f"imports:{cid}")]]))
 
 async def score_cmd(update, context):
     cid=update.effective_chat.id
@@ -497,6 +505,8 @@ async def group_page(update, chat_id):
     else:
         kb=[[InlineKeyboardButton("成员积分",callback_data=f"search:{chat_id}")],[InlineKeyboardButton("今日排名",callback_data=f"stat:{chat_id}:1")],[InlineKeyboardButton("累计排名",callback_data=f"stat:{chat_id}:0")]]
     if level >= 2:
+        kb.append([InlineKeyboardButton(label("导出数据","Export data"),callback_data=f"export:{chat_id}"),InlineKeyboardButton(label("导入数据","Import data"),callback_data=f"import:{chat_id}")])
+        kb.append([InlineKeyboardButton(label("导入记录","Import history"),callback_data=f"imports:{chat_id}")])
         kb.append([InlineKeyboardButton(label("积分规则","Point rules"),callback_data=f"set:{chat_id}")])
         kb.append([InlineKeyboardButton(label("自定义命令","Custom commands"),callback_data=f"alias:{chat_id}")])
     if level >= 2:
@@ -509,7 +519,7 @@ async def group_page(update, chat_id):
 async def callback(update, context):
     q=update.callback_query; await q.answer(); uid=q.from_user.id; data=q.data
     if data=="noop": return
-    protected=("g:","search:","member:","adjust:","recent:","stat:","set:","edit:","alias:","addalias:","delalias:","custom:","lang:","tz:","tzlist:")
+    protected=("g:","search:","member:","adjust:","recent:","stat:","set:","edit:","alias:","addalias:","delalias:","custom:","lang:","tz:","tzlist:","export:","import:","imports:")
     if uid != OWNER_ID and data.startswith(protected):
         # callback data is prefix:chat_id:..., and Telegram group IDs are negative.
         try: protected_chat=int(data.split(":")[1])
@@ -546,6 +556,18 @@ async def callback(update, context):
         if not page: return await q.edit_message_text("权限已变化，请重新进入。")
         context.user_data["chat_id"]=cid
         return await q.edit_message_text(page[0],reply_markup=page[1])
+    if data.startswith("export:"):
+        cid=int(data[7:]); payload=store.export_chat(cid)
+        from telegram import InputFile
+        import io
+        return await q.message.reply_document(InputFile(io.BytesIO(payload.encode()), filename=f"points-{cid}.json"))
+    if data.startswith("import:"):
+        cid=int(data[7:]); context.user_data["chat_id"]=cid
+        return await q.edit_message_text(tr(cid,"请把导出的 JSON 文件发送到这里。机器人会核对文件绑定的群组 ID。","Send the exported JSON file here. The bound group ID will be checked."))
+    if data.startswith("imports:"):
+        cid=int(data[8:]); rows=store.import_history(cid)
+        body="\n".join(f"{r['imported_at']} | 操作者 {r['operator_id']} | {r['user_count']} 名成员 | {r['source']}" for r in rows) or "暂无导入记录"
+        return await q.edit_message_text(tr(cid,"导入记录：\n"+body,"Import history:\n"+body))
     if data=="home": return await q.edit_message_text("总管理员" if uid==OWNER_ID else "选择群组",reply_markup=owner_home_keyboard() if uid==OWNER_ID else await group_keyboard(update,False))
     if data.startswith("search:"):
         cid=int(data[7:]); context.user_data["state"]="search"; context.user_data["chat_id"]=cid; return await q.edit_message_text(tr(cid,"请输入完整数字 Telegram ID：","Enter the full numeric Telegram ID:"))
@@ -708,7 +730,7 @@ async def post_shutdown(application):
 
 def build_app(token):
     app=Application.builder().token(token).post_init(post_init).post_shutdown(post_shutdown).build()
-    app.add_handler(CommandHandler("activate",activate)); app.add_handler(CommandHandler("export",export_cmd)); app.add_handler(CommandHandler("import",import_cmd)); app.add_handler(CommandHandler("score",score_cmd)); app.add_handler(CommandHandler("rank",lambda u,c:rank_cmd(u,c,False))); app.add_handler(CommandHandler("today",lambda u,c:rank_cmd(u,c,True))); app.add_handler(CommandHandler("addpoints",lambda u,c:points_cmd(u,c,"addpoints"))); app.add_handler(CommandHandler("subpoints",lambda u,c:points_cmd(u,c,"subpoints"))); app.add_handler(CommandHandler("start",start)); app.add_handler(CallbackQueryHandler(callback)); app.add_handler(MessageHandler(filters.TEXT,text_handler)); return app
+    app.add_handler(CommandHandler("activate",activate)); app.add_handler(CommandHandler("score",score_cmd)); app.add_handler(CommandHandler("rank",lambda u,c:rank_cmd(u,c,False))); app.add_handler(CommandHandler("today",lambda u,c:rank_cmd(u,c,True))); app.add_handler(CommandHandler("addpoints",lambda u,c:points_cmd(u,c,"addpoints"))); app.add_handler(CommandHandler("subpoints",lambda u,c:points_cmd(u,c,"subpoints"))); app.add_handler(CommandHandler("start",start)); app.add_handler(CallbackQueryHandler(callback)); app.add_handler(MessageHandler(filters.Document.ALL,document_handler)); app.add_handler(MessageHandler(filters.TEXT,text_handler)); return app
 
 
 def main():

@@ -129,6 +129,19 @@ class PointsTests(unittest.TestCase):
         self.s.award_chat(-1, 1, "u1", "User 1", "hello")
         daily,total_daily=self.s.ranking(-1,True,0,15); self.assertEqual(total_daily,1); self.assertEqual(daily[0]["user_id"],1)
 
+    def test_export_import_is_bound_to_one_chat_and_is_audited(self):
+        self.s.upsert_user(-1, 7, "alice", "Alice")
+        payload = self.s.export_chat(-1)
+        with self.assertRaisesRegex(ValueError, "不是本群"):
+            self.s.import_chat(-2, 99, payload)
+        self.assertEqual(self.s.import_chat(-1, 99, payload), 1)
+        history = self.s.import_history(-1)
+        self.assertEqual((history[0]["operator_id"], history[0]["user_count"]), (99, 1))
+
+    def test_import_rejects_unbound_legacy_snapshot(self):
+        with self.assertRaisesRegex(ValueError, "不是本群"):
+            self.s.import_chat(-1, 99, {"users": []})
+
     def test_high_volume_messages_respect_daily_limit(self):
         self.s.set_setting(-1, "min_chars", 1)
         self.s.set_setting(-1, "daily_limit", 1000)
