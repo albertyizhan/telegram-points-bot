@@ -4,6 +4,7 @@ import re
 import secrets
 import sqlite3
 import threading
+import json
 from datetime import datetime, timedelta, timezone as dt_timezone
 from zoneinfo import ZoneInfo
 
@@ -109,6 +110,7 @@ class Store:
             CREATE TABLE IF NOT EXISTS daily(chat_id INTEGER, user_id INTEGER, day TEXT, chat_points INTEGER NOT NULL DEFAULT 0, checked_in INTEGER NOT NULL DEFAULT 0, checkin_points INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(chat_id,user_id,day), FOREIGN KEY(chat_id,user_id) REFERENCES users(chat_id,user_id) ON DELETE CASCADE);
             CREATE TABLE IF NOT EXISTS aliases(chat_id INTEGER, action TEXT, alias TEXT, PRIMARY KEY(chat_id,alias), FOREIGN KEY(chat_id) REFERENCES chats(chat_id) ON DELETE CASCADE);
             CREATE TABLE IF NOT EXISTS adjustments(id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, operator_id INTEGER, target_id INTEGER, delta INTEGER, before_points INTEGER, after_points INTEGER, method TEXT, created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS data_imports(id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, operator_id INTEGER NOT NULL, imported_at TEXT NOT NULL, user_count INTEGER NOT NULL DEFAULT 0, source TEXT NOT NULL DEFAULT 'json');
             """)
             for table, column, definition in (
                 ("chats", "authorized_by", "INTEGER"),
@@ -298,6 +300,30 @@ class Store:
             rows = self.conn.execute("SELECT user_id,display_name,username,total_points AS points FROM users WHERE chat_id=? ORDER BY points DESC,user_id LIMIT ? OFFSET ?", (chat_id,size,offset)).fetchall()
             total = self.conn.execute("SELECT COUNT(*) FROM users WHERE chat_id=?", (chat_id,)).fetchone()[0]
         return rows, total
+
+    def export_chat(self, chat_id):
+        """Return a portable JSON snapshot of one group's points data."""
+        settings = self.settings(chat_id)
+        if not settings: raise ValueError("群组不存在")
+        users = [dict(r) for r in self.conn.execute("SELECT user_id,username,display_name,total_points,updated_at FROM users WHERE chat_id=?", (chat_id,))]
+        daily = [dict(r) for r in self.conn.execute("SELECT user_id,day,chat_points,checked_in,checkin_points FROM daily WHERE chat_id=?", (chat_id,))]
+        return json.dumps({"version": 1, "chat_id": chat_id, "settings": dict(settings), "users": users, "daily": daily}, ensure_ascii=False, indent=2)
+
+    def import_chat(self, chat_id, operator_id, payload, source="json"):
+        """Merge a snapshot and leave an auditable import record."""
+        data = json.loads(payload) if isinstance(payload, str) else payload
+        if not isinstance(data, dict) or not isinstance(data.get("users", []), list): raise ValueError("导入文件格式无效")
+        count = 0
+        with db_lock, self.conn:
+            for u in data["users"]:
+                uid = int(u["user_id"]); self.conn.execute("INSERT INTO users(chat_id,user_id,username,display_name,total_points,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(chat_id,user_id) DO UPDATE SET username=excluded.username,display_name=excluded.display_name,total_points=excluded.total_points,updated_at=excluded.updated_at", (chat_id,uid,u.get("username"),u.get("display_name") or str(uid),int(u.get("total_points",0)),u.get("updated_at") or self.chat_now(chat_id))); count += 1
+            for d in data.get("daily", []):
+                self.conn.execute("INSERT INTO daily(chat_id,user_id,day,chat_points,checked_in,checkin_points) VALUES(?,?,?,?,?,?) ON CONFLICT(chat_id,user_id,day) DO UPDATE SET chat_points=excluded.chat_points,checked_in=excluded.checked_in,checkin_points=excluded.checkin_points", (chat_id,int(d["user_id"]),d["day"],int(d.get("chat_points",0)),int(bool(d.get("checked_in",0))),int(d.get("checkin_points",0))))
+            self.conn.execute("INSERT INTO data_imports(chat_id,operator_id,imported_at,user_count,source) VALUES(?,?,?,?,?)", (chat_id,operator_id,self.chat_now(chat_id),count,source))
+        return count
+
+    def import_history(self, chat_id, limit=20):
+        return self.conn.execute("SELECT * FROM data_imports WHERE chat_id=? ORDER BY id DESC LIMIT ?", (chat_id,limit)).fetchall()
 
 store = Store()
 
