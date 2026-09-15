@@ -5,6 +5,7 @@ import secrets
 import sqlite3
 import threading
 import json
+import shutil
 from datetime import datetime, timedelta, timezone as dt_timezone
 from zoneinfo import ZoneInfo
 
@@ -111,11 +112,13 @@ class Store:
             CREATE TABLE IF NOT EXISTS aliases(chat_id INTEGER, action TEXT, alias TEXT, PRIMARY KEY(chat_id,alias), FOREIGN KEY(chat_id) REFERENCES chats(chat_id) ON DELETE CASCADE);
             CREATE TABLE IF NOT EXISTS adjustments(id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, operator_id INTEGER, target_id INTEGER, delta INTEGER, before_points INTEGER, after_points INTEGER, method TEXT, created_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS data_imports(id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, operator_id INTEGER NOT NULL, imported_at TEXT NOT NULL, user_count INTEGER NOT NULL DEFAULT 0, source TEXT NOT NULL DEFAULT 'json');
+            CREATE TABLE IF NOT EXISTS message_fingerprints(chat_id INTEGER,user_id INTEGER,fingerprint TEXT,created_at TEXT NOT NULL,PRIMARY KEY(chat_id,user_id,fingerprint));
             """)
             for table, column, definition in (
                 ("chats", "authorized_by", "INTEGER"),
                 ("settings", "language", "TEXT NOT NULL DEFAULT 'zh'"),
                 ("settings", "timezone", "TEXT NOT NULL DEFAULT 'Asia/Hong_Kong'"),
+                ("adjustments", "reason", "TEXT NOT NULL DEFAULT ''"),
             ):
                 try: self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
                 except sqlite3.OperationalError: pass
@@ -235,6 +238,9 @@ class Store:
         current_day = day(s["timezone"])
         timestamp = now(s["timezone"])
         with db_lock, self.conn:
+            fingerprint = hashlib.sha256(text.strip().casefold().encode()).hexdigest()
+            # Keep fingerprints for future anti-spam reporting; scoring remains configurable by daily limit.
+            self.conn.execute("INSERT OR REPLACE INTO message_fingerprints VALUES(?,?,?,?)", (chat_id,user_id,fingerprint,timestamp))
             self.conn.execute("INSERT INTO users(chat_id,user_id,username,display_name,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(chat_id,user_id) DO UPDATE SET username=excluded.username,display_name=excluded.display_name,updated_at=excluded.updated_at", (chat_id,user_id,username,display_name,timestamp))
             self.conn.execute("INSERT INTO daily(chat_id,user_id,day) VALUES(?,?,?) ON CONFLICT DO NOTHING", (chat_id,user_id,current_day))
             if s["daily_limit"]:
@@ -272,7 +278,7 @@ class Store:
         q=query.lstrip("@").lower(); rows=self.conn.execute("SELECT * FROM users WHERE chat_id=? AND lower(username)=?", (chat_id,q)).fetchall()
         return rows[0] if len(rows)==1 else (None if not rows else "conflict")
 
-    def adjust(self, chat_id, operator_id, target_id, delta, method):
+    def adjust(self, chat_id, operator_id, target_id, delta, method, reason=""):
         if not 1 <= abs(delta) <= 1000000: raise ValueError("数量必须是 1 到 1000000 的整数")
         if not self.authorized(chat_id): raise ValueError("本群尚未激活积分功能")
         with db_lock, self.conn:
@@ -281,8 +287,13 @@ class Store:
             before=r[0]; after=before+delta
             if after<0: raise ValueError("积分不能低于 0")
             self.conn.execute("UPDATE users SET total_points=?,updated_at=? WHERE chat_id=? AND user_id=?", (after,self.chat_now(chat_id),chat_id,target_id))
-            self.conn.execute("INSERT INTO adjustments(chat_id,operator_id,target_id,delta,before_points,after_points,method,created_at) VALUES(?,?,?,?,?,?,?,?)", (chat_id,operator_id,target_id,delta,before,after,method,self.chat_now(chat_id)))
+            self.conn.execute("INSERT INTO adjustments(chat_id,operator_id,target_id,delta,before_points,after_points,method,created_at,reason) VALUES(?,?,?,?,?,?,?,?,?)", (chat_id,operator_id,target_id,delta,before,after,method,self.chat_now(chat_id),reason[:200]))
             return before,after
+
+    def undo_adjustment(self, chat_id, operator_id, adjustment_id):
+        row = self.conn.execute("SELECT target_id,delta FROM adjustments WHERE id=? AND chat_id=?", (adjustment_id,chat_id)).fetchone()
+        if not row: raise ValueError("找不到该调整记录")
+        return self.adjust(chat_id, operator_id, row[0], -row[1], "undo", "撤销调整 #" + str(adjustment_id))
 
     def recent(self, chat_id, user_id): return self.conn.execute("SELECT * FROM adjustments WHERE chat_id=? AND target_id=? ORDER BY id DESC LIMIT 20", (chat_id,user_id)).fetchall()
 
@@ -312,6 +323,7 @@ class Store:
     def import_chat(self, chat_id, operator_id, payload, source="json"):
         """Merge a snapshot and leave an auditable import record."""
         data = json.loads(payload) if isinstance(payload, str) else payload
+        if isinstance(payload, str) and len(payload.encode()) > 10 * 1024 * 1024: raise ValueError("导入文件过大")
         if not isinstance(data, dict) or data.get("chat_id") != chat_id or not isinstance(data.get("users", []), list): raise ValueError("导入文件不是本群数据，已取消")
         count = 0
         with db_lock, self.conn:
@@ -332,6 +344,9 @@ class Store:
 
     def import_history(self, chat_id, limit=20):
         return self.conn.execute("SELECT * FROM data_imports WHERE chat_id=? ORDER BY id DESC LIMIT ?", (chat_id,limit)).fetchall()
+
+    def backup(self, path):
+        self.conn.commit(); shutil.copy2(self.conn.execute("PRAGMA database_list").fetchone()[2], path)
 
 store = Store()
 
@@ -576,15 +591,15 @@ async def callback(update, context):
         if uid!=OWNER_ID and not await is_admin(update,cs): return await q.edit_message_text("权限已变化，请重新进入。")
         return await member_page(q,context,cs,us)
     if data.startswith("adjust:"):
-        _,cs,us,delta=data.split(":"); delta=int(delta); cs=int(cs); us=int(us); context.user_data["pending"]=(cs,us,delta); u=store.find_user(cs,us); chat=store.conn.execute("SELECT title FROM chats WHERE chat_id=?",(cs,)).fetchone(); title=chat[0] if chat else str(cs); english=store.settings(cs)["language"] == "en"
+        _,cs,us,delta=data.split(":"); delta=int(delta); cs=int(cs); us=int(us); context.user_data["pending"]=(cs,us,delta,""); u=store.find_user(cs,us); chat=store.conn.execute("SELECT title FROM chats WHERE chat_id=?",(cs,)).fetchone(); title=chat[0] if chat else str(cs); english=store.settings(cs)["language"] == "en"
         confirm=tr(cs,f"群组：{title}\n{u['display_name']}（{us}）\n当前积分：{u['total_points']}\n本次变化：{delta:+d}\n调整后：{u['total_points']+delta}",f"Group: {title}\n{u['display_name']} ({us})\nCurrent points: {u['total_points']}\nChange: {delta:+d}\nAfter: {u['total_points']+delta}")
         return await q.edit_message_text(confirm,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Confirm" if english else "确认",callback_data="confirm"),InlineKeyboardButton("Cancel" if english else "取消",callback_data=f"member:{cs}:{us}")]]))
     if data=="confirm":
         p=context.user_data.pop("pending",None)
         if not p:return await q.edit_message_text("This action was already processed." if uid == OWNER_ID else "该操作已处理。")
-        cid,tid,delta=p
+        cid,tid,delta,reason=(p+("",))[:4]
         if uid!=OWNER_ID and not await is_admin(update,cid): return await q.edit_message_text("权限已变化，操作取消。")
-        try: before,after=store.adjust(cid,uid,tid,delta,"后台")
+        try: before,after=store.adjust(cid,uid,tid,delta,"后台",reason)
         except ValueError as e:return await q.edit_message_text(tr_error(cid, str(e)))
         return await member_page(q,context,cid,tid,tr(cid,f"已调整：{before} -> {after}",f"Updated: {before} -> {after}"))
     if data.startswith("recent:"):
@@ -707,12 +722,15 @@ async def private_text(update, context):
         p=text.split(None,1)
         if len(p)!=2 or not store.add_alias(cid,p[0].lower(),p[1]):return await update.effective_message.reply_text(tr(cid,"格式错误或别名冲突，请使用：score /points","Invalid format or conflicting alias. Example: score /points"))
         context.user_data.pop("state",None); return await update.effective_message.reply_text(tr(cid,"别名已保存。","Alias saved."),reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back" if store.settings(cid)["language"] == "en" else "返回",callback_data=f"g:{cid}")]]))
+    if state=="reason":
+        cs,us,delta=context.user_data.pop("reason_pending"); context.user_data.pop("state",None); context.user_data["pending"]=(cs,us,delta,text[:200])
+        return await update.effective_message.reply_text(tr(cs,"原因已记录，请点击确认。","Reason saved. Please confirm."),reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("确认" if store.settings(cs)["language"] == "zh" else "Confirm",callback_data="confirm")]]))
     if state=="custom":
         if not text.isdigit() or not 1<=int(text)<=1000000:return await update.effective_message.reply_text(tr(cid,"请输入 1 到 1000000 的整数。","Enter an integer from 1 to 1,000,000."))
         cs,us,sign=context.user_data.pop("custom"); context.user_data.pop("state",None)
-        delta=sign*int(text); u=store.find_user(cs,us); context.user_data["pending"]=(cs,us,delta)
+        delta=sign*int(text); u=store.find_user(cs,us); context.user_data["state"]="reason"; context.user_data["reason_pending"]=(cs,us,delta)
         chat=store.conn.execute("SELECT title FROM chats WHERE chat_id=?",(cs,)).fetchone(); title=chat[0] if chat else str(cs)
-        english=store.settings(cs)["language"] == "en"; return await update.effective_message.reply_text(tr(cs,f"群组：{title}\n确认调整 {u['display_name']}（{us}）\n当前积分：{u['total_points']}\n本次变化：{delta:+d}\n调整后：{u['total_points']+delta}",f"Group: {title}\nConfirm adjustment for {u['display_name']} ({us})\nCurrent points: {u['total_points']}\nChange: {delta:+d}\nAfter: {u['total_points']+delta}"),reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Confirm" if english else "确认",callback_data="confirm"),InlineKeyboardButton("Cancel" if english else "取消",callback_data=f"member:{cs}:{us}")]]))
+        english=store.settings(cs)["language"] == "en"; return await update.effective_message.reply_text(tr(cs,"请输入调整原因：","Enter the reason for this adjustment:"))
 
 
 async def post_init(application):

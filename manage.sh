@@ -20,6 +20,7 @@ usage() {
   status            查看运行状态和最近日志
   run               前台运行（调试用）
   update            拉取 GitHub 更新、安装依赖并重启
+  backup [文件]     创建 SQLite 备份
 EOF
 }
 
@@ -149,6 +150,11 @@ update_bot() {
 }
 
 case "${1:-}" in
+  backup)
+    dest="${2:-$ROOT/points-$(date +%Y%m%d-%H%M%S).db}"
+    "$PYTHON" -c "from bot import Store; s=Store(); s.backup(\"$dest\"); s.close()"
+    echo "备份已创建：$dest";;
+
   start) shift; start_bot "$@";;
   stop) shift; stop_bot "$@";;
   restart) stop_bot; start_bot;;
