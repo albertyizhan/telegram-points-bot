@@ -1,12 +1,14 @@
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 # Keep bot's import-time runtime store out of the project directory.
 _IMPORT_DB = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
 _IMPORT_DB.close()
 os.environ["DB_PATH"] = _IMPORT_DB.name
 from bot import COMMANDS, Store, timezone_for
+from bot import adjustment_history, adjustment_summary, member_identity, who
 
 
 class PointsTests(unittest.TestCase):
@@ -57,6 +59,30 @@ class PointsTests(unittest.TestCase):
         with self.assertRaises(ValueError): self.s.adjust(-1, 99, 7, -11, "reply")
         self.assertEqual(len(self.s.recent(-1,7)), 1)
         self.assertEqual(self.s.find_user(-1, "@alice")["user_id"], 7); self.assertIsNone(self.s.find_user(-1,"missing"))
+
+    def test_member_labels_and_adjustment_history(self):
+        self.s.upsert_user(-1, 7, "alice", "Alice")
+        self.s.upsert_user(-1, 99, "admin", "Admin")
+        self.s.upsert_user(-1, 8, None, "No username")
+        self.s.adjust(-1, 99, 7, 10, "reply", "活动奖励")
+        with patch("bot.store", self.s):
+            self.assertEqual(who(self.s.find_user(-1, "7")), "@alice")
+            self.assertEqual(member_identity(-1, 8), "No username (ID: 8)")
+            self.assertEqual(member_identity(-1, 100), "ID: 100")
+            history = adjustment_history(-1, 7)
+            for text in ("@alice", "@admin", "+10 分", "0 → 10", "活动奖励", "回复消息"):
+                self.assertIn(text, history)
+            self.s.set_language(-1, "en")
+            self.assertIn("By: @admin", adjustment_history(-1, 7))
+            self.assertIn("Change: -2 points", adjustment_summary(-1, 7, -2))
+
+    def test_adjustment_history_pages_do_not_skip_entries(self):
+        self.s.upsert_user(-1, 7, "alice", "Alice")
+        for index in range(12):
+            self.s.adjust(-1, 99, 7, 1, "后台", str(index))
+        pages = [self.s.recent(-1, 7, page, 5) for page in range(3)]
+        self.assertEqual([len(rows) for rows in pages], [5, 5, 2])
+        self.assertEqual(len({r["id"] for rows in pages for r in rows}), 12)
 
     def test_manual_adjustment_leaves_daily_state_unchanged(self):
         self.s.set_setting(-1, "daily_limit", 1)
