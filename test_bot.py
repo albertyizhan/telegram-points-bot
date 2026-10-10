@@ -1,7 +1,11 @@
 import os
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, AsyncMock
+from types import SimpleNamespace
+import asyncio
+import sqlite3
+import json
 
 # Keep bot's import-time runtime store out of the project directory.
 _IMPORT_DB = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
@@ -9,6 +13,7 @@ _IMPORT_DB.close()
 os.environ["DB_PATH"] = _IMPORT_DB.name
 from bot import COMMANDS, Store, timezone_for
 from bot import adjustment_history, adjustment_summary, member_identity, who
+from bot import callback, private_text, document_handler
 
 
 class PointsTests(unittest.TestCase):
@@ -83,6 +88,78 @@ class PointsTests(unittest.TestCase):
         pages = [self.s.recent(-1, 7, page, 5) for page in range(3)]
         self.assertEqual([len(rows) for rows in pages], [5, 5, 2])
         self.assertEqual(len({r["id"] for rows in pages for r in rows}), 12)
+
+    def test_undo_is_once_only_and_preserves_other_changes(self):
+        self.s.upsert_user(-1, 7, "alice", "Alice")
+        self.s.adjust(-1, 99, 7, 10, "reply")
+        aid = self.s.recent(-1, 7)[0]["id"]
+        self.s.adjust(-1, 99, 7, 5, "reply")
+        self.assertEqual(self.s.undo_adjustment(-1, 99, aid), (15, 5))
+        with self.assertRaises(ValueError): self.s.undo_adjustment(-1, 99, aid)
+        with self.assertRaises(ValueError): self.s.undo_adjustment(-1, 99, self.s.recent(-1, 7)[0]["id"])
+        self.assertEqual(self.s.total(-1, 7), 5)
+
+    def test_import_rejects_invalid_values_and_rolls_back(self):
+        self.s.upsert_user(-1, 7, "alice", "Alice")
+        for key, value in (("total_points", -1), ("total_points", 1.5), ("user_id", 0)):
+            data = json.loads(self.s.export_chat(-1))
+            data["users"][0][key] = value
+            with self.assertRaises(ValueError): self.s.import_chat(-1, 99, data)
+        for date in ("2026-02-30", "2026-1-01"):
+            data = {"chat_id": -1, "users": [{"user_id": 7, "total_points": 100}],
+                    "daily": [{"user_id": 7, "day": date}]}
+            with self.assertRaises(ValueError): self.s.import_chat(-1, 99, data)
+        data = {"chat_id": -1, "users": [{"user_id": 7, "total_points": 100}],
+                "daily": [{"user_id": 123, "day": "2026-10-10"}]}
+        with self.assertRaises(ValueError): self.s.import_chat(-1, 99, data)
+        self.assertEqual(self.s.total(-1, 7), 0)
+        self.assertEqual(len(self.s.import_history(-1)), 0)
+        with patch("bot.json.loads") as loads:
+            with self.assertRaisesRegex(ValueError, "过大"):
+                self.s.import_chat(-1, 99, " " * (10 * 1024 * 1024 + 1))
+            loads.assert_not_called()
+
+    def test_backup_includes_committed_wal_data(self):
+        self.s.upsert_user(-1, 7, "alice", "Alice")
+        self.s.adjust(-1, 99, 7, 10, "reply")
+        with tempfile.NamedTemporaryFile(suffix=".db") as target:
+            self.s.backup(target.name)
+            conn = sqlite3.connect(target.name)
+            try: self.assertEqual(conn.execute("SELECT total_points FROM users WHERE user_id=7").fetchone()[0], 10)
+            finally: conn.close()
+
+    def test_private_flows_search_cancel_undo_and_ranking(self):
+        self.s.upsert_user(-1, 7, "alice", "Alice")
+        self.s.adjust(-1, 99, 7, 10, "reply")
+        aid = self.s.recent(-1, 7)[0]["id"]
+        user = SimpleNamespace(id=99, username="admin", full_name="Admin")
+        q = SimpleNamespace(data=f"undo_recent:-1:7:{aid}", from_user=user,
+                            answer=AsyncMock(), edit_message_text=AsyncMock())
+        message = SimpleNamespace(text="missing", reply_text=AsyncMock())
+        update = SimpleNamespace(callback_query=q, effective_chat=SimpleNamespace(type="private"),
+                                 effective_user=user, effective_message=message)
+        context = SimpleNamespace(user_data={"chat_id": -1, "state": "search"})
+        with patch("bot.store", self.s), patch("bot.is_admin", new=AsyncMock(return_value=True)):
+            asyncio.run(private_text(update, context))
+            self.assertNotIn("state", context.user_data)
+            asyncio.run(callback(update, context))
+            self.assertEqual(self.s.total(-1, 7), 10)
+            self.assertIn("确认撤销", q.edit_message_text.call_args.args[0])
+            q.data=f"undo_confirm:-1:7:{aid}"
+            asyncio.run(callback(update, context))
+            self.assertEqual(self.s.total(-1, 7), 0)
+            q.data="stat:-1:0"
+            for uid in range(20, 40): self.s.upsert_user(-1, uid, f"u{uid}", str(uid))
+            asyncio.run(callback(update, context))
+            markup=q.edit_message_text.call_args.kwargs["reply_markup"]
+            self.assertIn("rank:-1:0:0", [b.callback_data for row in markup.inline_keyboard for b in row])
+
+    def test_document_without_filename_has_recovery_buttons(self):
+        message=SimpleNamespace(document=SimpleNamespace(file_name=None), reply_text=AsyncMock())
+        update=SimpleNamespace(effective_chat=SimpleNamespace(type="private"), effective_message=message)
+        with patch("bot.store", self.s), patch("bot.is_admin", new=AsyncMock(return_value=True)):
+            asyncio.run(document_handler(update, SimpleNamespace(user_data={"chat_id": -1})))
+        self.assertIn("reply_markup", message.reply_text.call_args.kwargs)
 
     def test_manual_adjustment_leaves_daily_state_unchanged(self):
         self.s.set_setting(-1, "daily_limit", 1)

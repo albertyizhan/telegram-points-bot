@@ -5,7 +5,6 @@ import secrets
 import sqlite3
 import threading
 import json
-import shutil
 from datetime import datetime, timedelta, timezone as dt_timezone
 from zoneinfo import ZoneInfo
 
@@ -296,9 +295,13 @@ class Store:
             return before,after
 
     def undo_adjustment(self, chat_id, operator_id, adjustment_id):
-        row = self.conn.execute("SELECT target_id,delta FROM adjustments WHERE id=? AND chat_id=?", (adjustment_id,chat_id)).fetchone()
-        if not row: raise ValueError("找不到该调整记录")
-        return self.adjust(chat_id, operator_id, row[0], -row[1], "undo", "撤销调整 #" + str(adjustment_id))
+        with db_lock, self.conn:
+            row = self.conn.execute("SELECT target_id,delta,method FROM adjustments WHERE id=? AND chat_id=?", (adjustment_id,chat_id)).fetchone()
+            if not row: raise ValueError("找不到该调整记录")
+            reason = "撤销调整 #" + str(adjustment_id)
+            if row["method"] == "undo" or self.conn.execute("SELECT 1 FROM adjustments WHERE chat_id=? AND method='undo' AND reason=?", (chat_id, reason)).fetchone():
+                raise ValueError("该记录已撤销或属于撤销记录")
+            return self.adjust(chat_id, operator_id, row[0], -row[1], "undo", reason)
 
     def recent(self, chat_id, user_id, page=0, size=20):
         return self.conn.execute("SELECT * FROM adjustments WHERE chat_id=? AND target_id=? ORDER BY id DESC LIMIT ? OFFSET ?", (chat_id,user_id,size,page*size)).fetchall()
@@ -328,23 +331,53 @@ class Store:
 
     def import_chat(self, chat_id, operator_id, payload, source="json"):
         """Merge a snapshot and leave an auditable import record."""
+        if isinstance(payload, str) and len(payload.encode("utf-8")) > 10 * 1024 * 1024: raise ValueError("导入文件过大")
         data = json.loads(payload) if isinstance(payload, str) else payload
-        if isinstance(payload, str) and len(payload.encode()) > 10 * 1024 * 1024: raise ValueError("导入文件过大")
         if not isinstance(data, dict) or data.get("chat_id") != chat_id or not isinstance(data.get("users", []), list): raise ValueError("导入文件不是本群数据，已取消")
+        if not isinstance(data.get("daily", []), list): raise ValueError("导入文件中的每日记录格式无效")
+        def integer(value, maximum=9223372036854775807):
+            if type(value) is not int or not 0 <= value <= maximum:
+                raise ValueError("导入文件中的数值必须是有效的非负整数")
+        for u in data["users"]:
+            if not isinstance(u, dict) or "user_id" not in u: raise ValueError("导入文件中的成员格式无效")
+            integer(u["user_id"]); integer(u.get("total_points", 0))
+            if not u["user_id"]: raise ValueError("导入文件中的成员 ID 无效")
+            if u.get("username") is not None and not isinstance(u["username"], str): raise ValueError("导入文件中的用户名无效")
+            if u.get("display_name") is not None and not isinstance(u["display_name"], str): raise ValueError("导入文件中的昵称无效")
+            if u.get("updated_at"):
+                try: datetime.fromisoformat(u["updated_at"])
+                except (TypeError, ValueError): raise ValueError("导入文件中的更新时间无效")
+        for d in data.get("daily", []):
+            if not isinstance(d, dict) or "user_id" not in d or "day" not in d: raise ValueError("导入文件中的每日记录格式无效")
+            integer(d["user_id"]); integer(d.get("chat_points", 0)); integer(d.get("checkin_points", 0), 1000000)
+            if type(d.get("checked_in", 0)) not in (int, bool) or d.get("checked_in", 0) not in (0, 1): raise ValueError("导入文件中的签到状态无效")
+            try:
+                if not isinstance(d["day"], str) or datetime.strptime(d["day"], "%Y-%m-%d").strftime("%Y-%m-%d") != d["day"]: raise ValueError()
+            except (TypeError, ValueError): raise ValueError("导入文件中的日期无效")
+            if not d.get("checked_in", 0) and d.get("checkin_points", 0): raise ValueError("未签到的记录不能包含签到奖励")
         count = 0
         with db_lock, self.conn:
             settings = data.get("settings")
             if isinstance(settings, dict):
-                values = [int(settings.get(key, default)) for key, default in (("min_chars", 5), ("daily_limit", 20), ("checkin_points", 5))]
+                values = [settings.get(key, default) for key, default in (("min_chars", 5), ("daily_limit", 20), ("checkin_points", 5))]
+                for value in values: integer(value, 1000000)
                 if any(value < 0 or value > 1000000 for value in values): raise ValueError("导入文件中的设置值无效")
                 language = settings.get("language", "zh"); timezone = settings.get("timezone", DEFAULT_TIMEZONE)
                 if language not in ("zh", "en"): raise ValueError("导入文件中的语言设置无效")
-                timezone_for(timezone)
+                try: timezone_for(timezone)
+                except (TypeError, ValueError, KeyError): raise ValueError("导入文件中的时区无效")
                 self.conn.execute("UPDATE settings SET min_chars=?,daily_limit=?,checkin_points=?,language=?,timezone=? WHERE chat_id=?", (*values, language, timezone, chat_id))
             for u in data["users"]:
-                uid = int(u["user_id"]); self.conn.execute("INSERT INTO users(chat_id,user_id,username,display_name,total_points,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(chat_id,user_id) DO UPDATE SET username=excluded.username,display_name=excluded.display_name,total_points=excluded.total_points,updated_at=excluded.updated_at", (chat_id,uid,u.get("username"),u.get("display_name") or str(uid),int(u.get("total_points",0)),u.get("updated_at") or self.chat_now(chat_id))); count += 1
+                uid = int(u["user_id"]); total = int(u.get("total_points", 0))
+                if uid <= 0 or total < 0: raise ValueError("导入文件中的成员积分无效")
+                self.conn.execute("INSERT INTO users(chat_id,user_id,username,display_name,total_points,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(chat_id,user_id) DO UPDATE SET username=excluded.username,display_name=excluded.display_name,total_points=excluded.total_points,updated_at=excluded.updated_at", (chat_id,uid,u.get("username"),u.get("display_name") or str(uid),total,u.get("updated_at") or self.chat_now(chat_id))); count += 1
             for d in data.get("daily", []):
-                self.conn.execute("INSERT INTO daily(chat_id,user_id,day,chat_points,checked_in,checkin_points) VALUES(?,?,?,?,?,?) ON CONFLICT(chat_id,user_id,day) DO UPDATE SET chat_points=excluded.chat_points,checked_in=excluded.checked_in,checkin_points=excluded.checkin_points", (chat_id,int(d["user_id"]),d["day"],int(d.get("chat_points",0)),int(bool(d.get("checked_in",0))),int(d.get("checkin_points",0))))
+                uid = int(d["user_id"]); chat_points = int(d.get("chat_points", 0)); checkin_points = int(d.get("checkin_points", 0))
+                if uid <= 0 or chat_points < 0 or checkin_points < 0 or checkin_points > 1000000:
+                    raise ValueError("导入文件中的每日积分记录无效")
+                if not self.conn.execute("SELECT 1 FROM users WHERE chat_id=? AND user_id=?", (chat_id, uid)).fetchone():
+                    raise ValueError("导入文件中的每日记录找不到对应成员")
+                self.conn.execute("INSERT INTO daily(chat_id,user_id,day,chat_points,checked_in,checkin_points) VALUES(?,?,?,?,?,?) ON CONFLICT(chat_id,user_id,day) DO UPDATE SET chat_points=excluded.chat_points,checked_in=excluded.checked_in,checkin_points=excluded.checkin_points", (chat_id,uid,d["day"],chat_points,int(bool(d.get("checked_in",0))),checkin_points))
             self.conn.execute("INSERT INTO data_imports(chat_id,operator_id,imported_at,user_count,source) VALUES(?,?,?,?,?)", (chat_id,operator_id,self.chat_now(chat_id),count,source))
         return count
 
@@ -352,7 +385,12 @@ class Store:
         return self.conn.execute("SELECT * FROM data_imports WHERE chat_id=? ORDER BY id DESC LIMIT ?", (chat_id,limit)).fetchall()
 
     def backup(self, path):
-        self.conn.commit(); shutil.copy2(self.conn.execute("PRAGMA database_list").fetchone()[2], path)
+        target = sqlite3.connect(path)
+        try:
+            with db_lock:
+                self.conn.backup(target)
+        finally:
+            target.close()
 
 store = Store()
 
@@ -403,8 +441,8 @@ def adjustment_history(cid, uid, page=0):
                    "后台": ("私聊管理", "Private management"), "undo": ("撤销调整", "Reversal")}
         method = methods.get(r["method"], (r["method"], r["method"]))
         blocks.append(tr(cid,
-            f"{readable_time(r['created_at'])} · {r['delta']:+d} 分\n总积分：{r['before_points']} → {r['after_points']}\n操作者：{member_identity(cid, r['operator_id'])}\n方式：{method[0]}\n原因：{r['reason'] or '未填写'}",
-            f"{readable_time(r['created_at'])} · {r['delta']:+d} points\nTotal points: {r['before_points']} → {r['after_points']}\nBy: {member_identity(cid, r['operator_id'])}\nVia: {method[1]}\nReason: {r['reason'] or 'Not provided'}"))
+            f"记录 #{r['id']} · {readable_time(r['created_at'])} · {r['delta']:+d} 分\n总积分：{r['before_points']} → {r['after_points']}\n操作者：{member_identity(cid, r['operator_id'])}\n方式：{method[0]}\n原因：{r['reason'] or '未填写'}",
+            f"Entry #{r['id']} · {readable_time(r['created_at'])} · {r['delta']:+d} points\nTotal points: {r['before_points']} → {r['after_points']}\nBy: {member_identity(cid, r['operator_id'])}\nVia: {method[1]}\nReason: {r['reason'] or 'Not provided'}"))
     return tr(cid, f"积分调整记录\n成员：{member_identity(cid, uid)}\n第 {page + 1} 页",
               f"Point adjustment history\nMember: {member_identity(cid, uid)}\nPage {page + 1}") + "\n\n" + (
         "\n\n".join(blocks) or tr(cid, "该成员暂无积分调整记录。", "No point adjustments for this member yet."))
@@ -445,9 +483,11 @@ async def document_handler(update, context):
     if not cid or not await is_admin(update, cid, 2):
         return await update.effective_message.reply_text("请先从群组管理页选择群组，再点击“导入数据”。", reply_markup=back_keyboard())
     document = update.effective_message.document
-    if not document.file_name.lower().endswith(".json"):
+    if not document.file_name or not document.file_name.lower().endswith(".json"):
         return await update.effective_message.reply_text("只支持 JSON 导入文件。", reply_markup=back_keyboard(cid, f"import:{cid}", "重新导入", "Retry import"))
     try:
+        if document.file_size and document.file_size > 10 * 1024 * 1024:
+            raise ValueError("导入文件过大")
         payload = (await (await document.get_file()).download_as_bytearray()).decode("utf-8")
         store.upsert_user(cid, update.effective_user.id, update.effective_user.username, update.effective_user.full_name)
         count = store.import_chat(cid, update.effective_user.id, payload, "button")
@@ -600,13 +640,15 @@ async def callback(update, context):
     if data=="noop": return
     if data not in ("confirm", "save_setting", "cancel_setting"):
         clear_management_input(context)
-    protected=("g:","search:","member:","adjust:","recent:","stat:","set:","edit:","alias:","addalias:","delalias:","custom:","lang:","tz:","tzlist:","export:","import:","imports:")
+    protected=("g:","search:","member:","adjust:","recent:","undo_recent:","undo_confirm:","stat:","set:","edit:","alias:","addalias:","delalias:","custom:","lang:","tz:","tzlist:","export:","import:","imports:")
     if uid != OWNER_ID and data.startswith(protected):
         # callback data is prefix:chat_id:..., and Telegram group IDs are negative.
         try: protected_chat=int(data.split(":")[1])
         except (ValueError, IndexError): return await q.edit_message_text("无效操作。", reply_markup=back_keyboard())
         required = 2 if data.startswith(("set:","edit:","alias:","addalias:","delalias:","lang:","tz:","tzlist:")) else 1
-        if not await is_admin(update, protected_chat, required): return await q.edit_message_text("权限不足或权限已变化，操作取消。", reply_markup=back_keyboard())
+        if not await is_admin(update, protected_chat, required):
+            parent = f"g:{protected_chat}" if await is_admin(update, protected_chat) else "home:0"
+            return await q.edit_message_text("权限不足或权限已变化，操作取消。", reply_markup=back_keyboard(parent=parent))
     if data.startswith(protected) and update.effective_chat.type == "private":
         context.user_data["chat_id"] = int(data.split(":")[1])
     if data.startswith("home:"):
@@ -649,7 +691,8 @@ async def callback(update, context):
         return await q.edit_message_text(tr(cid,"请把导出的 JSON 文件发送到这里。机器人会核对文件绑定的群组 ID。","Send the exported JSON file here. The bound group ID will be checked."), reply_markup=back_keyboard(cid))
     if data.startswith("imports:"):
         cid=int(data[8:]); rows=store.import_history(cid)
-        body="\n\n".join(tr(cid, f"{readable_time(r['imported_at'])}\n操作者：{member_identity(cid, r['operator_id'])}\n导入成员：{r['user_count']} 人", f"{readable_time(r['imported_at'])}\nBy: {member_identity(cid, r['operator_id'])}\nMembers imported: {r['user_count']}") for r in rows) or tr(cid, "本群暂无导入记录。", "No imports for this group yet.")
+        sources={"button": ("管理菜单导入", "Management menu"), "json": ("JSON 数据导入", "JSON import")}
+        body="\n\n".join(tr(cid, f"导入 #{r['id']} · {readable_time(r['imported_at'])}\n操作者：{member_identity(cid, r['operator_id'])}\n导入成员：{r['user_count']} 人\n来源：{sources.get(r['source'], (r['source'], r['source']))[0]}", f"Import #{r['id']} · {readable_time(r['imported_at'])}\nBy: {member_identity(cid, r['operator_id'])}\nMembers imported: {r['user_count']}\nSource: {sources.get(r['source'], (r['source'], r['source']))[1]}") for r in rows) or tr(cid, "本群暂无导入记录。", "No imports for this group yet.")
         return await q.edit_message_text(tr(cid,"导入记录：\n"+body,"Import history:\n"+body), reply_markup=back_keyboard(cid))
     if data=="home": return await q.edit_message_text("总管理员" if uid==OWNER_ID else "选择群组",reply_markup=owner_home_keyboard() if uid==OWNER_ID else await group_keyboard(update,False))
     if data.startswith("search:"):
@@ -673,16 +716,37 @@ async def callback(update, context):
         return await member_page(q,context,cid,tid,tr(cid,f"已调整：{before} -> {after}",f"Updated: {before} -> {after}"))
     if data.startswith("recent:"):
         parts=data.split(":"); cs=int(parts[1]); us=int(parts[2]); page=int(parts[3]) if len(parts)>3 else 0
+        rows=store.recent(cs, us, page, 5)
         nav=[]
         if page: nav.append(InlineKeyboardButton(tr(cs, "上一页", "Previous"), callback_data=f"recent:{cs}:{us}:{page-1}"))
         if store.recent(cs, us, page+1, 5): nav.append(InlineKeyboardButton(tr(cs, "下一页", "Next"), callback_data=f"recent:{cs}:{us}:{page+1}"))
-        buttons=([nav] if nav else []) + [[InlineKeyboardButton(tr(cs, "返回成员", "Back to member"), callback_data=f"member:{cs}:{us}")]]
+        undo_buttons = [[InlineKeyboardButton(tr(cs, f"撤销记录 #{r['id']}", f"Undo entry #{r['id']}"), callback_data=f"undo_recent:{cs}:{us}:{r['id']}")] for r in rows if r["method"] != "undo" and not store.conn.execute("SELECT 1 FROM adjustments WHERE chat_id=? AND method='undo' AND reason=?", (cs, f"撤销调整 #{r['id']}")).fetchone()]
+        buttons=([nav] if nav else []) + undo_buttons + [[InlineKeyboardButton(tr(cs, "返回成员", "Back to member"), callback_data=f"member:{cs}:{us}")]]
         return await q.edit_message_text(adjustment_history(cs, us, page), reply_markup=InlineKeyboardMarkup(buttons))
+    if data.startswith("undo_recent:"):
+        _,cs,us,aid=data.split(":"); cs=int(cs); us=int(us); aid=int(aid)
+        row=store.conn.execute("SELECT * FROM adjustments WHERE id=? AND chat_id=? AND target_id=?", (aid,cs,us)).fetchone()
+        if not row: return await q.edit_message_text("找不到该调整记录。", reply_markup=back_keyboard(cs))
+        return await q.edit_message_text(tr(cs, f"确认撤销记录 #{aid}？\n成员：{member_identity(cs, us)}\n本次将调整：{-row['delta']:+d} 分\n其他积分变动保持不变。", f"Undo entry #{aid}?\nMember: {member_identity(cs, us)}\nChange: {-row['delta']:+d} points\nOther point changes are preserved."), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(tr(cs,"确认撤销","Confirm undo"),callback_data=f"undo_confirm:{cs}:{us}:{aid}"),InlineKeyboardButton(tr(cs,"取消","Cancel"),callback_data=f"recent:{cs}:{us}")]]))
+    if data.startswith("undo_confirm:"):
+        _,cs,us,aid=data.split(":"); cs=int(cs); us=int(us); aid=int(aid)
+        row=store.conn.execute("SELECT target_id,delta FROM adjustments WHERE id=? AND chat_id=?", (aid, cs)).fetchone()
+        if not row or row["target_id"] != us:
+            return await q.edit_message_text(tr(cs, "找不到这条调整记录。", "Adjustment record not found."), reply_markup=back_keyboard(cs, f"recent:{cs}:{us}", "返回调整记录", "Back to history"))
+        store.upsert_user(cs, uid, q.from_user.username, q.from_user.full_name)
+        try:
+            store.undo_adjustment(cs, uid, aid)
+        except ValueError as e:
+            return await q.edit_message_text(tr_error(cs, str(e)), reply_markup=back_keyboard(cs, f"recent:{cs}:{us}", "返回调整记录", "Back to history"))
+        return await member_page(q, context, cs, us, tr(cs, f"已撤销记录 #{aid}。", f"Entry #{aid} undone."))
     if data.startswith("stat:"):
-        _,cs,today_flag=data.split(":"); cs=int(cs); rows=store.stats(cs,today_flag=="1")
+        _,cs,today_flag=data.split(":"); cs=int(cs); rows,total=store.ranking(cs,today_flag=="1",0,15)
         title=tr(cs, "今日积分排名" if today_flag=="1" else "累计积分排名", "Today's ranking" if today_flag=="1" else "All-time ranking")
         body="\n".join(f"{i+1}. {who(r)} · {r['points']} " + tr(cs, "分", "points") for i,r in enumerate(rows)) or tr(cs, "暂无积分记录。", "No points recorded yet.")
-        return await q.edit_message_text(title+"\n\n"+body, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(tr(cs, "返回群组", "Back to group"), callback_data=f"g:{cs}")]]))
+        buttons=[]
+        if total > len(rows): buttons.append(InlineKeyboardButton(tr(cs, "查看完整排名", "View full ranking"), callback_data=f"rank:{cs}:{today_flag}:0"))
+        buttons.append(InlineKeyboardButton(tr(cs, "返回群组", "Back to group"), callback_data=f"g:{cs}"))
+        return await q.edit_message_text(title+"\n\n"+body, reply_markup=InlineKeyboardMarkup([buttons]))
     if data.startswith("rank:"):
         _,cs,today_flag,page=data.split(":"); cs=int(cs); today_flag=bool(int(today_flag)); page=int(page); rows,total=store.ranking(cs,today_flag,page,15); english=store.settings(cs)["language"] == "en"; title=("Today's ranking" if today_flag else "Total ranking") if english else ("单日积分排行" if today_flag else "累计积分排行"); start=page*15; body="\n".join(f"{start+i+1}. {who(r)} · {r['points']} " + tr(cs, "分", "points") for i,r in enumerate(rows)) or tr(cs, "暂无积分记录。", "No points recorded yet."); buttons=[]
         if page>0: buttons.append(InlineKeyboardButton("Previous" if english else "上一页",callback_data=f"rank:{cs}:{int(today_flag)}:{page-1}"))
@@ -798,8 +862,10 @@ async def private_text(update, context):
         return await update.effective_message.reply_text("选择要停用积分功能的群组：",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(r["title"],callback_data=f"revokeask:{r['chat_id']}:owner")] for r in rows[:20]]+[[InlineKeyboardButton("返回已激活群组",callback_data="ownerauthorized")]]))
     if state=="search":
         u=store.find_user(cid,text)
-        if u == "conflict": return await update.effective_message.reply_text(tr(cid,"该用户名对应多个历史成员，请改用数字 ID。", "Multiple recorded members use this username. Use a numeric ID."), reply_markup=back_keyboard(cid))
-        if not u:return await update.effective_message.reply_text(tr(cid,"未找到该成员。请核对 @用户名或数字 ID，并确认成员已在本群发言或签到。","Member not found. Check the @username or numeric ID and make sure they have spoken or checked in in this group."), reply_markup=back_keyboard(cid))
+        if u == "conflict" or not u:
+            context.user_data.pop("state", None)
+        if u == "conflict": return await update.effective_message.reply_text(tr(cid,"该用户名对应多个历史成员，请改用数字 ID。", "Multiple recorded members use this username. Use a numeric ID."), reply_markup=back_keyboard(cid, f"search:{cid}", "重新搜索", "Search again"))
+        if not u:return await update.effective_message.reply_text(tr(cid,"未找到该成员。请核对 @用户名或数字 ID，并确认成员已在本群发言或签到。","Member not found. Check the @username or numeric ID and make sure they have spoken or checked in in this group."), reply_markup=back_keyboard(cid, f"search:{cid}", "重新搜索", "Search again"))
         context.user_data.pop("state",None); english=store.settings(cid)["language"] == "en"
         rows=[[InlineKeyboardButton("Open member" if english else "查看成员积分",callback_data=f"member:{cid}:{u['user_id']}")],
               [InlineKeyboardButton(tr(cid, "查找其他成员", "Find another member"), callback_data=f"search:{cid}")]]
