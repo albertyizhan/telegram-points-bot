@@ -20,6 +20,13 @@ from telegram.ext import (
     MessageHandler, filters,
 )
 
+REGISTERED_COMMANDS = set()
+
+
+def alias_key(alias):
+    return hashlib.sha1(alias.encode()).hexdigest()[:10]
+
+
 DEFAULT_TIMEZONE = "Asia/Hong_Kong"
 TIMEZONE_OPTIONS = ["UTC-08:00", "UTC-05:00", "UTC+00:00", "UTC+01:00", "UTC+05:30", "UTC+08:00", "UTC+09:00", "UTC+10:00", "UTC+12:00"]
 TIMEZONE_LABELS = {
@@ -127,8 +134,8 @@ class Store:
             """)
             self.conn.commit()
             version = self.conn.execute("PRAGMA user_version").fetchone()[0]
-            if version > 2: raise ValueError("数据库版本高于当前程序支持的版本")
-            if version < 2 and self.conn.execute("SELECT 1 FROM chats LIMIT 1").fetchone():
+            if version > 3: raise ValueError("数据库版本高于当前程序支持的版本")
+            if version < 3 and self.conn.execute("SELECT 1 FROM chats LIMIT 1").fetchone():
                 from pathlib import Path
                 directory=Path(self.path).resolve().parent / "backups"
                 directory.mkdir(exist_ok=True)
@@ -158,6 +165,22 @@ class Store:
                     self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_adjustments_reverts ON adjustments(reverts_id) WHERE reverts_id IS NOT NULL")
                     self.conn.execute("DELETE FROM message_fingerprints")
                     self.conn.execute("PRAGMA user_version=2")
+            if version < 3:
+                with self.conn:
+                    self.conn.execute("BEGIN IMMEDIATE")
+                    rows=self.conn.execute("SELECT rowid,* FROM aliases ORDER BY rowid").fetchall()
+                    seen=set()
+                    for row in rows:
+                        normalized=row["alias"].lower()
+                        key=(row["chat_id"],normalized)
+                        if key in seen:
+                            logging.getLogger(__name__).warning("Duplicate alias removed in group %s: %s",*key)
+                            self.conn.execute("DELETE FROM aliases WHERE rowid=?",(row["rowid"],))
+                        else:
+                            self.conn.execute("UPDATE aliases SET alias=? WHERE rowid=?",(normalized,row["rowid"]))
+                            seen.add(key)
+                    self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_aliases_unique ON aliases(chat_id,alias)")
+                    self.conn.execute("PRAGMA user_version=3")
             # Migrate old one-group code bindings to the new one-license-per-person model.
             self.conn.execute("INSERT OR IGNORE INTO settings(chat_id) SELECT chat_id FROM chats")
             self.conn.execute("INSERT OR IGNORE INTO licenses(user_id,code_hash,bound_at) SELECT used_by,code_hash,COALESCE(used_at,created_at) FROM auth_codes WHERE used_by IS NOT NULL")
@@ -292,9 +315,10 @@ class Store:
         return r[0] if r else None
 
     def add_alias(self, chat_id, action, alias):
-        alias = alias.strip()
-        if not alias or action not in DEFAULTS: return False
+        alias = alias.strip().lower()
+        if not alias or len(alias)>16 or action not in DEFAULTS: return False
         if alias.startswith("/"): alias = alias.split()[0].split("@",1)[0].lower()
+        if alias.lstrip("/") in REGISTERED_COMMANDS: return False
         if any(alias.lower() == x.lower() for xs in DEFAULTS.values() for x in xs): return False
         try:
             with self.conn: self.conn.execute("INSERT INTO aliases(chat_id,action,alias) VALUES(?,?,?)", (chat_id,action,alias))
@@ -999,7 +1023,7 @@ async def callback_action(update, context):
         zero = {"min_chars": ("0 表示不限制消息长度", "0 means no minimum length"), "daily_limit": ("0 表示不限制每日聊天积分", "0 means unlimited daily chat points"), "checkin_points": ("0 表示签到不奖励积分", "0 means no check-in reward")}[key]
         return await q.edit_message_text(tr(cs, f"{SETTING_LABELS[key][0]}\n请输入 0 到 1000000 的整数，{zero[0]}。", f"{SETTING_LABELS[key][1]}\nEnter an integer from 0 to 1,000,000; {zero[1]}."), reply_markup=back_keyboard(cs, f"set:{cs}", "返回积分规则", "Back to rules"))
     if data.startswith("alias:"):
-        cid=int(data[6:]); ars=store.aliases(cid); english=store.settings(cid)["language"] == "en"; kb=[[InlineKeyboardButton((f"Remove shortcut {r['alias']}" if english else f"删除快捷名称 {r['alias']}"),callback_data=f"delalias:{cid}:{r['alias']}")] for r in ars]
+        cid=int(data[6:]); ars=store.aliases(cid); english=store.settings(cid)["language"] == "en"; kb=[[InlineKeyboardButton((f"Remove shortcut {r['alias']}" if english else f"删除快捷名称 {r['alias']}"),callback_data=f"delalias:{cid}:{alias_key(r['alias'])}")] for r in ars]
         kb.append([InlineKeyboardButton("Add a command shortcut" if english else "添加自定义命令名称",callback_data=f"addalias:{cid}"),InlineKeyboardButton("Back to group" if english else "返回群组",callback_data=f"g:{cid}")])
         body="\n".join(f"{tr(cid, *ACTION_LABELS[r['action']])}：{r['alias']}" for r in ars)
         return await q.edit_message_text(tr(cid,"自定义命令\n\n"+(body or "尚未添加自定义命令。"),"Custom commands\n\n"+(body or "No custom commands yet.")),reply_markup=InlineKeyboardMarkup(kb))
@@ -1008,7 +1032,10 @@ async def callback_action(update, context):
         functions="\n".join(f"{action} — {tr(cid, *labels)}" for action, labels in ACTION_LABELS.items())
         return await q.edit_message_text(tr(cid,"添加自定义命令\n请输入：功能代码 自定义命令\n例如：score /积分\n\n可选功能：\n"+functions,"Add a custom command\nEnter: function code shortcut\nExample: score /points\n\nAvailable functions:\n"+functions), reply_markup=back_keyboard(cid, f"alias:{cid}", "返回自定义命令", "Back to custom commands"))
     if data.startswith("delalias:"):
-        _,cs,alias=data.split(":",2); cid=int(cs); store.remove_alias(cid,alias); english=store.settings(cid)["language"] == "en"; return await q.edit_message_text("Command shortcut removed." if english else "自定义命令已删除。",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back to shortcuts" if english else "返回自定义命令",callback_data=f"alias:{cs}")]]))
+        _,cs,key=data.split(":",2); cid=int(cs)
+        matches=[r["alias"] for r in store.aliases(cid) if alias_key(r["alias"])==key]
+        if len(matches)!=1: return await q.answer("按钮已失效，请重新操作",show_alert=True)
+        store.remove_alias(cid,matches[0]); english=store.settings(cid)["language"] == "en"; return await q.edit_message_text("Command shortcut removed." if english else "自定义命令已删除。",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back to shortcuts" if english else "返回自定义命令",callback_data=f"alias:{cs}")]]))
     if data.startswith("revokeask:"):
         if uid!=OWNER_ID:return
         parts=data.split(":"); cid=int(parts[1]); owner_list=len(parts)>2 and parts[2]=="owner"; chat=store.conn.execute("SELECT title,enabled FROM chats WHERE chat_id=?",(cid,)).fetchone()
@@ -1151,16 +1178,22 @@ async def error_handler(update, context):
     logging.getLogger(__name__).error("Update processing failed", exc_info=(type(exc), exc, exc.__traceback__))
 
 
-def build_app(token):
-    app = (Application.builder().token(token).rate_limiter(AIORateLimiter(max_retries=3))
-           .post_init(post_init).post_shutdown(post_shutdown).build())
-    commands = {
+def command_handlers():
+    return {
         "activate": activate, "score": score_cmd, "checkin": text_handler,
         "rank": lambda u,c: rank_cmd(u,c,False), "today": lambda u,c: rank_cmd(u,c,True),
         "addpoints": lambda u,c: points_cmd(u,c,"addpoints"),
         "subpoints": lambda u,c: points_cmd(u,c,"subpoints"), "start": start,
     }
-    for command, handler in commands.items():
+
+
+REGISTERED_COMMANDS.update(command_handlers())
+
+
+def build_app(token):
+    app = (Application.builder().token(token).rate_limiter(AIORateLimiter(max_retries=3))
+           .post_init(post_init).post_shutdown(post_shutdown).build())
+    for command, handler in command_handlers().items():
         app.add_handler(CommandHandler(command, handler, filters=filters.UpdateType.MESSAGE))
     app.add_handler(ChatMemberHandler(bot_membership, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & filters.StatusUpdate.MIGRATE, migrate_group))

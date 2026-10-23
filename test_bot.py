@@ -254,7 +254,7 @@ class PointsTests(unittest.TestCase):
             fixed=lambda tz: datetime(2026,3,8,7,1,tzinfo=timezone.utc).astimezone(tz)
             migrated=Store(path,now_fn=fixed)
             try:
-                self.assertEqual(migrated.conn.execute("PRAGMA user_version").fetchone()[0],2)
+                self.assertEqual(migrated.conn.execute("PRAGMA user_version").fetchone()[0],3)
                 self.assertEqual(len(list((Path(tmp)/"backups").glob("*.db"))),1)
                 migrated.init()
                 self.assertEqual(len(list((Path(tmp)/"backups").glob("*.db"))),1)
@@ -318,6 +318,26 @@ class PointsTests(unittest.TestCase):
         with patch("bot.store",self.s),patch("bot.is_admin",new=AsyncMock(return_value=True)):
             asyncio.run(points_cmd(update,SimpleNamespace(args=["10"]),"addpoints"))
         self.assertEqual(self.s.total(-1,7),10)
+
+    def test_alias_length_case_commands_and_callback_bytes(self):
+        from bot import alias_key, command_handlers
+        self.assertTrue(self.s.add_alias(-1,"score","Ok"))
+        self.assertFalse(self.s.add_alias(-1,"score","ok"))
+        self.assertFalse(self.s.add_alias(-1,"score","中"*17))
+        for command in command_handlers():
+            self.assertFalse(self.s.add_alias(-1,"score",command))
+            self.assertFalse(self.s.add_alias(-1,"score","/"+command))
+        self.assertTrue(self.s.add_alias(-1,"score","中"*16))
+        user=SimpleNamespace(id=99)
+        q=SimpleNamespace(data="alias:-1",from_user=user,answer=AsyncMock(),edit_message_text=AsyncMock())
+        update=SimpleNamespace(callback_query=q,effective_user=user,effective_chat=SimpleNamespace(type="private"))
+        with patch("bot.store",self.s),patch("bot.is_admin",new=AsyncMock(return_value=True)):
+            asyncio.run(callback(update,SimpleNamespace(user_data={})))
+        for row in q.edit_message_text.call_args.kwargs["reply_markup"].inline_keyboard:
+            for button in row:
+                data=button.callback_data.replace("-1","-1009999999999")
+                self.assertLessEqual(len(data.encode()),64)
+        self.assertLessEqual(len(f"delalias:-1009999999999:{alias_key('中'*16)}".encode()),64)
 
     def test_private_flows_search_cancel_undo_and_ranking(self):
         self.s.upsert_user(-1, 7, "alice", "Alice")
