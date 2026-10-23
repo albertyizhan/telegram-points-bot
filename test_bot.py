@@ -280,6 +280,45 @@ class PointsTests(unittest.TestCase):
             self.assertEqual(self.s.conn.execute("SELECT count(*) FROM message_fingerprints").fetchone()[0],0)
         finally: other.close()
 
+    def test_import_preview_confirmation_backup_and_expiry(self):
+        from bot import document_handler
+        from pathlib import Path
+        import time
+        with tempfile.TemporaryDirectory() as tmp:
+            local=Store(str(Path(tmp)/"import.db"))
+            try:
+                local.authorize(-1,"one",None,99,owner=True)
+                user=SimpleNamespace(id=99,username="admin",full_name="Admin")
+                payload=json.dumps({"chat_id":-1,"users":[{"user_id":7,"display_name":"Alice","total_points":10}]})
+                doc=SimpleNamespace(file_name="points.json",file_size=len(payload),get_file=AsyncMock(return_value=SimpleNamespace(download_as_bytearray=AsyncMock(return_value=bytearray(payload.encode())))))
+                message=SimpleNamespace(document=doc,reply_text=AsyncMock())
+                q=SimpleNamespace(data="",from_user=user,answer=AsyncMock(),edit_message_text=AsyncMock())
+                update=SimpleNamespace(effective_chat=SimpleNamespace(type="private"),effective_user=user,effective_message=message,callback_query=q)
+                context=SimpleNamespace(user_data={"chat_id":-1,"awaiting_import":{"chat_id":-1,"expires_at":time.time()+600}})
+                with patch("bot.store",local),patch("bot.is_admin",new=AsyncMock(return_value=True)):
+                    asyncio.run(document_handler(update,context))
+                    self.assertIsNone(local.find_user(-1,"7"))
+                    q.data=message.reply_text.call_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data
+                    asyncio.run(callback(update,context))
+                    self.assertEqual(local.total(-1,7),10)
+                    self.assertEqual(local.recent(-1,7)[0]["method"],"import")
+                    self.assertEqual(len(list((Path(tmp)/"backups").glob("pre-import-*.db"))),1)
+                    context.user_data["awaiting_import"]={"chat_id":-1,"expires_at":0}
+                    doc.get_file.reset_mock()
+                    asyncio.run(document_handler(update,context))
+                    doc.get_file.assert_not_called()
+            finally: local.close()
+
+    def test_reply_to_unrecorded_member_can_adjust(self):
+        from bot import points_cmd
+        target=SimpleNamespace(id=7,username="alice",full_name="Alice",is_bot=False)
+        user=SimpleNamespace(id=99,username="admin",full_name="Admin",is_bot=False)
+        m=SimpleNamespace(text="/addpoints 10",sender_chat=None,reply_to_message=SimpleNamespace(from_user=target),reply_text=AsyncMock())
+        update=SimpleNamespace(effective_chat=SimpleNamespace(id=-1),effective_user=user,effective_message=m)
+        with patch("bot.store",self.s),patch("bot.is_admin",new=AsyncMock(return_value=True)):
+            asyncio.run(points_cmd(update,SimpleNamespace(args=["10"]),"addpoints"))
+        self.assertEqual(self.s.total(-1,7),10)
+
     def test_private_flows_search_cancel_undo_and_ranking(self):
         self.s.upsert_user(-1, 7, "alice", "Alice")
         self.s.adjust(-1, 99, 7, 10, "reply")

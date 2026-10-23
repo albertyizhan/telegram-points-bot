@@ -411,9 +411,12 @@ class Store:
         def integer(value, maximum=9223372036854775807):
             if type(value) is not int or not 0 <= value <= maximum:
                 raise ValueError("导入文件中的数值必须是有效的非负整数")
+        seen=set()
         for u in data["users"]:
             if not isinstance(u, dict) or "user_id" not in u: raise ValueError("导入文件中的成员格式无效")
             integer(u["user_id"]); integer(u.get("total_points", 0))
+            if u["user_id"] in seen: raise ValueError("导入文件包含重复成员")
+            seen.add(u["user_id"])
             if not u["user_id"]: raise ValueError("导入文件中的成员 ID 无效")
             if u.get("username") is not None and not isinstance(u["username"], str): raise ValueError("导入文件中的用户名无效")
             if u.get("display_name") is not None and not isinstance(u["display_name"], str): raise ValueError("导入文件中的昵称无效")
@@ -443,6 +446,9 @@ class Store:
             for u in data["users"]:
                 uid = int(u["user_id"]); total = int(u.get("total_points", 0))
                 if uid <= 0 or total < 0: raise ValueError("导入文件中的成员积分无效")
+                before=self.total(chat_id,uid)
+                if total!=before:
+                    self.conn.execute("INSERT INTO adjustments(chat_id,operator_id,target_id,delta,before_points,after_points,method,created_at,reason) VALUES(?,?,?,?,?,?, 'import',?,?)",(chat_id,operator_id,uid,total-before,before,total,self.chat_now(chat_id),"数据导入"))
                 self.conn.execute("INSERT INTO users(chat_id,user_id,username,display_name,total_points,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(chat_id,user_id) DO UPDATE SET username=excluded.username,display_name=excluded.display_name,total_points=excluded.total_points,updated_at=excluded.updated_at", (chat_id,uid,u.get("username"),u.get("display_name") or str(uid),total,u.get("updated_at") or self.chat_now(chat_id))); count += 1
             for d in data.get("daily", []):
                 uid = int(d["user_id"]); chat_points = int(d.get("chat_points", 0)); checkin_points = int(d.get("checkin_points", 0))
@@ -453,6 +459,29 @@ class Store:
                 self.conn.execute("INSERT INTO daily(chat_id,user_id,day,chat_points,checked_in,checkin_points) VALUES(?,?,?,?,?,?) ON CONFLICT(chat_id,user_id,day) DO UPDATE SET chat_points=excluded.chat_points,checked_in=excluded.checked_in,checkin_points=excluded.checkin_points", (chat_id,uid,d["day"],chat_points,int(bool(d.get("checked_in",0))),checkin_points))
             self.conn.execute("INSERT INTO data_imports(chat_id,operator_id,imported_at,user_count,source) VALUES(?,?,?,?,?)", (chat_id,operator_id,self.chat_now(chat_id),count,source))
         return count
+
+    def preview_import(self, chat_id, operator_id, payload):
+        clone=Store(":memory:", now_fn=self.now_fn)
+        try:
+            self.conn.backup(clone.conn)
+            clone.import_chat(chat_id,operator_id,payload)
+            before={r["user_id"]: r["total_points"] for r in self.conn.execute("SELECT * FROM users WHERE chat_id=?",(chat_id,))}
+            data=json.loads(payload) if isinstance(payload,str) else payload
+            selected={u["user_id"] for u in data["users"]}
+            after={r["user_id"]: r for r in clone.conn.execute("SELECT * FROM users WHERE chat_id=?",(chat_id,)) if r["user_id"] in selected}
+            new=sum(uid not in before for uid in after)
+            changed=[(uid,r["total_points"]-before.get(uid,0),list_name(r)) for uid,r in after.items() if r["total_points"]!=before.get(uid,0)]
+            existing_changes=sum(uid in before for uid,_,_ in changed)
+            return {"new":new,"changed":existing_changes,"unchanged":len(after)-new-existing_changes,"delta":sum(d for _,d,_ in changed),"largest":sorted(changed,key=lambda r:abs(r[1]),reverse=True)[:5]}
+        finally: clone.close()
+
+    def backup_before_import(self, chat_id):
+        from pathlib import Path
+        directory=Path(self.path).resolve().parent / "backups"
+        directory.mkdir(exist_ok=True)
+        target=directory / f"pre-import-{chat_id}-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}.db"
+        self.backup(str(target))
+        return target
 
     def import_history(self, chat_id, limit=20):
         return self.conn.execute("SELECT * FROM data_imports WHERE chat_id=? ORDER BY id DESC LIMIT ?", (chat_id,limit)).fetchall()
@@ -593,9 +622,13 @@ async def activate(update, context):
 
 async def document_handler(update, context):
     if update.effective_chat.type != "private": return
-    cid = context.user_data.get("chat_id")
-    if not cid or not await is_admin(update, cid, 2):
-        return await update.effective_message.reply_text("请先从群组管理页选择群组，再点击“导入数据”。", reply_markup=back_keyboard())
+    pending=context.user_data.get("awaiting_import")
+    cid=pending["chat_id"] if pending else context.user_data.get("chat_id")
+    if not pending or pending["expires_at"] <= time.time():
+        context.user_data.pop("awaiting_import",None)
+        return await update.effective_message.reply_text("请先点击“导入数据”；导入入口有效期为 10 分钟。",reply_markup=back_keyboard(cid))
+    if not cid or not await is_admin(update,cid,2):
+        return await update.effective_message.reply_text("权限不足。",reply_markup=back_keyboard())
     document = update.effective_message.document
     if not document.file_name or not document.file_name.lower().endswith(".json"):
         return await update.effective_message.reply_text("只支持 JSON 导入文件。", reply_markup=back_keyboard(cid, f"import:{cid}", "重新导入", "Retry import"))
@@ -603,13 +636,14 @@ async def document_handler(update, context):
         if document.file_size and document.file_size > 10 * 1024 * 1024:
             raise ValueError("导入文件过大")
         payload = (await (await document.get_file()).download_as_bytearray()).decode("utf-8")
-        store.upsert_user(cid, update.effective_user.id, update.effective_user.username, update.effective_user.full_name)
-        count = store.import_chat(cid, update.effective_user.id, payload, "button")
+        preview = store.preview_import(cid, update.effective_user.id, payload)
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         return await update.effective_message.reply_text(f"导入失败：{exc}", reply_markup=back_keyboard(cid, f"import:{cid}", "重新导入", "Retry import"))
     except Exception:
         return await update.effective_message.reply_text("导入失败：无法读取文件。", reply_markup=back_keyboard(cid, f"import:{cid}", "重新导入", "Retry import"))
-    await update.effective_message.reply_text(f"导入成功，共处理 {count} 名成员，已留下导入记录。", reply_markup=back_keyboard(cid, f"imports:{cid}", "查看导入记录", "View import history"))
+    markup=confirmation(context,"import",(payload,time.time()+600),cid)
+    largest="\n".join(f"{name}: {delta:+d}" for _,delta,name in preview["largest"])
+    await update.effective_message.reply_text(f"导入预览 / Import preview\n新增 / New: {preview['new']} · 变化 / Changed: {preview['changed']} · 不变 / Unchanged: {preview['unchanged']}\n总分差额 / Point change: {preview['delta']:+d}\n{largest}",reply_markup=markup)
 
 async def score_cmd(update, context):
     if await reject_sender(update, False): return
@@ -650,7 +684,7 @@ async def points_cmd(update, context, action=None):
     target_name = who(target)
     if getattr(target,"is_bot",False): return await m.reply_text(tr(cid,"不能调整机器人积分。","Bot accounts cannot have points adjusted."))
     store.upsert_user(cid, update.effective_user.id, update.effective_user.username, update.effective_user.full_name)
-    if hasattr(target, "full_name") and store.find_user(cid, str(target_id)):
+    if hasattr(target, "full_name"):
         store.upsert_user(cid, target_id, target.username, target.full_name)
     try: before,after=store.adjust(cid,update.effective_user.id,target_id,(amount if action=="addpoints" else -amount),"reply" if m.reply_to_message else "username")
     except ValueError as e: return await m.reply_text(tr_error(cid, str(e)))
@@ -791,7 +825,7 @@ async def callback(update, context):
     if prefix in ("confirm","cancel","save_setting","cancel_setting"):
         if not pending or data not in (f"confirm:{pending['token']}",f"cancel:{pending['token']}"):
             return await q.answer("按钮已失效，请重新操作 / This button has expired", show_alert=True)
-        role="admin2" if pending["kind"]=="setting" else "admin1"
+        role="admin2" if pending["kind"] in ("setting","import") else "admin1"
         cid=pending["chat_id"]
         if not await is_admin(update,cid,2 if role=="admin2" else 1):
             return await q.answer("权限不足 / Permission denied",show_alert=True)
@@ -805,6 +839,15 @@ async def callback(update, context):
             try: store.set_setting(cid,*payload)
             except ValueError as exc: return await q.edit_message_text(tr_error(cid,str(exc)),reply_markup=back_keyboard(cid))
             return await settings_page(q,cid)
+        if kind=="import":
+            payload,expires=payload
+            if expires<=time.time(): return await q.edit_message_text("导入已过期，请重新操作。",reply_markup=back_keyboard(cid))
+            try:
+                backup=store.backup_before_import(cid)
+                count=store.import_chat(cid,q.from_user.id,payload,"button")
+            except (ValueError,sqlite3.Error,OSError) as exc:
+                return await q.edit_message_text(f"导入失败：{exc}",reply_markup=back_keyboard(cid))
+            return await q.edit_message_text(f"导入成功 / Import complete: {count}\n备份 / Backup: {backup.name}",reply_markup=back_keyboard(cid))
         if kind=="undo":
             us,aid=payload
             try: store.undo_adjustment(cid,q.from_user.id,aid)
@@ -885,6 +928,7 @@ async def callback_action(update, context):
         return await q.message.reply_document(InputFile(io.BytesIO(payload.encode()), filename=f"points-{cid}.json"), reply_markup=back_keyboard(cid))
     if data.startswith("import:"):
         cid=int(data[7:]); context.user_data["chat_id"]=cid
+        context.user_data["awaiting_import"]={"chat_id":cid,"expires_at":time.time()+600}
         return await q.edit_message_text(tr(cid,"请把导出的 JSON 文件发送到这里。机器人会核对文件绑定的群组 ID。","Send the exported JSON file here. The bound group ID will be checked."), reply_markup=back_keyboard(cid))
     if data.startswith("imports:"):
         cid=int(data[8:]); rows=store.import_history(cid)
