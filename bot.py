@@ -1,3 +1,4 @@
+import logging
 import hashlib
 import os
 import re
@@ -12,8 +13,9 @@ from telegram import (
     BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats,
     InlineKeyboardButton, InlineKeyboardMarkup, Update,
 )
+from telegram.error import BadRequest
 from telegram.ext import (
-    Application, CallbackQueryHandler, CommandHandler, ContextTypes,
+    AIORateLimiter, Application, CallbackQueryHandler, CommandHandler, ContextTypes,
     MessageHandler, filters,
 )
 
@@ -416,6 +418,35 @@ def who(u):
     return "@" + u["username"].lstrip("@") if u["username"] else u["display_name"]
 
 
+def list_name(u):
+    """Non-mentioning identity for rankings and audit lists."""
+    if hasattr(u, "full_name"):
+        name = u.full_name or u.username or str(u.id)
+    else:
+        name = u["display_name"] or u["username"] or str(u["user_id"])
+    return name.replace("@", "＠")
+
+
+def list_identity(cid, uid):
+    u = store.find_user(cid, str(uid))
+    return f"{list_name(u)} (ID: {uid})" if u and u != "conflict" else f"ID: {uid}"
+
+
+def addressed_to_other_bot(text, bot_username):
+    command = (text or "").split(None, 1)[0] if (text or "").strip() else ""
+    return command.startswith("/") and "@" in command and command.split("@", 1)[1].casefold() != (bot_username or "").casefold()
+
+
+async def reject_sender(update, management=False):
+    m = update.effective_message
+    if m and getattr(m, "sender_chat", None):
+        if management:
+            await m.reply_text(tr(update.effective_chat.id, "请关闭匿名后再操作", "Please disable anonymous mode before continuing"))
+        return True
+    u = update.effective_user
+    return not u or getattr(u, "is_bot", False)
+
+
 def member_identity(cid, uid):
     u = store.find_user(cid, str(uid))
     return f"{who(u)} (ID: {uid})" if u and u != "conflict" else f"ID: {uid}"
@@ -441,16 +472,19 @@ def adjustment_history(cid, uid, page=0):
                    "后台": ("私聊管理", "Private management"), "undo": ("撤销调整", "Reversal")}
         method = methods.get(r["method"], (r["method"], r["method"]))
         blocks.append(tr(cid,
-            f"记录 #{r['id']} · {readable_time(r['created_at'])} · {r['delta']:+d} 分\n总积分：{r['before_points']} → {r['after_points']}\n操作者：{member_identity(cid, r['operator_id'])}\n方式：{method[0]}\n原因：{r['reason'] or '未填写'}",
-            f"Entry #{r['id']} · {readable_time(r['created_at'])} · {r['delta']:+d} points\nTotal points: {r['before_points']} → {r['after_points']}\nBy: {member_identity(cid, r['operator_id'])}\nVia: {method[1]}\nReason: {r['reason'] or 'Not provided'}"))
-    return tr(cid, f"积分调整记录\n成员：{member_identity(cid, uid)}\n第 {page + 1} 页",
-              f"Point adjustment history\nMember: {member_identity(cid, uid)}\nPage {page + 1}") + "\n\n" + (
+            f"记录 #{r['id']} · {readable_time(r['created_at'])} · {r['delta']:+d} 分\n总积分：{r['before_points']} → {r['after_points']}\n操作者：{list_identity(cid, r['operator_id'])}\n方式：{method[0]}\n原因：{r['reason'] or '未填写'}",
+            f"Entry #{r['id']} · {readable_time(r['created_at'])} · {r['delta']:+d} points\nTotal points: {r['before_points']} → {r['after_points']}\nBy: {list_identity(cid, r['operator_id'])}\nVia: {method[1]}\nReason: {r['reason'] or 'Not provided'}"))
+    return tr(cid, f"积分调整记录\n成员：{list_identity(cid, uid)}\n第 {page + 1} 页",
+              f"Point adjustment history\nMember: {list_identity(cid, uid)}\nPage {page + 1}") + "\n\n" + (
         "\n\n".join(blocks) or tr(cid, "该成员暂无积分调整记录。", "No point adjustments for this member yet."))
 
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    m=update.effective_message; u=m.from_user
-    if not m or not u or u.is_bot: return
+    m=update.effective_message
+    if not m: return
+    if addressed_to_other_bot(m.text, context.bot.username): return
+    if await reject_sender(update, store.resolve_alias(update.effective_chat.id, m.text or "") in ("addpoints", "subpoints")): return
+    u=m.from_user
     if update.effective_chat.type == "private": return await private_text(update,context)
     cid=update.effective_chat.id
     action=store.resolve_alias(cid,m.text or "")
@@ -465,6 +499,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def activate(update, context):
+    if await reject_sender(update, True): return
     m=update.effective_message
     if update.effective_chat.type == "private": return await m.reply_text("请在群组中使用 /activate 激活。")
     if update.effective_user.id == OWNER_ID:
@@ -498,16 +533,18 @@ async def document_handler(update, context):
     await update.effective_message.reply_text(f"导入成功，共处理 {count} 名成员，已留下导入记录。", reply_markup=back_keyboard(cid, f"imports:{cid}", "查看导入记录", "View import history"))
 
 async def score_cmd(update, context):
+    if await reject_sender(update, False): return
     cid=update.effective_chat.id
     if not store.authorized(cid): return await update.effective_message.reply_text(tr(cid,"本群尚未激活积分功能，请先使用 /activate。","Points are not activated. Use /activate first."))
     t,c,checked=store.score(cid,update.effective_user.id); await update.effective_message.reply_text(tr(cid, f"{who(update.effective_user)} 的积分\n总积分：{t} 分\n今日聊天积分：{c} 分\n今日签到：{'已签到' if checked else '未签到'}", f"{who(update.effective_user)}'s points\nTotal points: {t}\nToday's chat points: {c}\nToday's check-in: {'Complete' if checked else 'Not checked in'}"))
 
 
 async def rank_cmd(update, context, today=False, page=0):
+    if await reject_sender(update, False): return
     cid=update.effective_chat.id
     if not store.authorized(cid): return await update.effective_message.reply_text(tr(cid,"本群尚未激活积分功能，请先使用 /activate。","Points are not activated. Use /activate first."))
     rows,total=store.ranking(cid,today,page,15); english=store.settings(cid)["language"] == "en"; title=("Today's ranking" if today else "All-time ranking") if english else ("今日积分排名" if today else "累计积分排名")
-    start=page*15; body="\n".join(f"{start+i+1}. {who(r)} · {r['points']} " + tr(cid, "分", "points") for i,r in enumerate(rows)) or tr(cid, "暂无积分记录。", "No points recorded yet.")
+    start=page*15; body="\n".join(f"{start+i+1}. {list_name(r)} · {r['points']} " + tr(cid, "分", "points") for i,r in enumerate(rows)) or tr(cid, "暂无积分记录。", "No points recorded yet.")
     buttons=[]
     if page>0: buttons.append(InlineKeyboardButton("Previous page" if english else "上一页",callback_data=f"rank:{cid}:{int(today)}:{page-1}"))
     if start+len(rows)<total: buttons.append(InlineKeyboardButton("Next page" if english else "下一页",callback_data=f"rank:{cid}:{int(today)}:{page+1}"))
@@ -516,6 +553,7 @@ async def rank_cmd(update, context, today=False, page=0):
 
 
 async def points_cmd(update, context, action=None):
+    if await reject_sender(update, True): return
     m=update.effective_message; cid=update.effective_chat.id
     if not store.authorized(cid): return await m.reply_text(tr(cid,"本群尚未激活积分功能，请先使用 /activate。","Points are not activated. Use /activate first."))
     if not await is_admin(update): return await m.reply_text(tr(cid,"只有本群管理员可以调整成员积分。","Only group administrators can adjust member points."))
@@ -542,6 +580,7 @@ async def points_cmd(update, context, action=None):
 
 
 async def start(update, context):
+    if await reject_sender(update, True): return
     if update.effective_chat.type != "private": return await update.effective_message.reply_text("请私聊机器人打开群组管理，查看积分、统计和规则。")
     clear_management_input(context)
     if update.effective_user.id != OWNER_ID:
@@ -742,13 +781,13 @@ async def callback(update, context):
     if data.startswith("stat:"):
         _,cs,today_flag=data.split(":"); cs=int(cs); rows,total=store.ranking(cs,today_flag=="1",0,15)
         title=tr(cs, "今日积分排名" if today_flag=="1" else "累计积分排名", "Today's ranking" if today_flag=="1" else "All-time ranking")
-        body="\n".join(f"{i+1}. {who(r)} · {r['points']} " + tr(cs, "分", "points") for i,r in enumerate(rows)) or tr(cs, "暂无积分记录。", "No points recorded yet.")
+        body="\n".join(f"{i+1}. {list_name(r)} · {r['points']} " + tr(cs, "分", "points") for i,r in enumerate(rows)) or tr(cs, "暂无积分记录。", "No points recorded yet.")
         buttons=[]
         if total > len(rows): buttons.append(InlineKeyboardButton(tr(cs, "查看完整排名", "View full ranking"), callback_data=f"rank:{cs}:{today_flag}:0"))
         buttons.append(InlineKeyboardButton(tr(cs, "返回群组", "Back to group"), callback_data=f"g:{cs}"))
         return await q.edit_message_text(title+"\n\n"+body, reply_markup=InlineKeyboardMarkup([buttons]))
     if data.startswith("rank:"):
-        _,cs,today_flag,page=data.split(":"); cs=int(cs); today_flag=bool(int(today_flag)); page=int(page); rows,total=store.ranking(cs,today_flag,page,15); english=store.settings(cs)["language"] == "en"; title=("Today's ranking" if today_flag else "Total ranking") if english else ("单日积分排行" if today_flag else "累计积分排行"); start=page*15; body="\n".join(f"{start+i+1}. {who(r)} · {r['points']} " + tr(cs, "分", "points") for i,r in enumerate(rows)) or tr(cs, "暂无积分记录。", "No points recorded yet."); buttons=[]
+        _,cs,today_flag,page=data.split(":"); cs=int(cs); today_flag=bool(int(today_flag)); page=int(page); rows,total=store.ranking(cs,today_flag,page,15); english=store.settings(cs)["language"] == "en"; title=("Today's ranking" if today_flag else "Total ranking") if english else ("单日积分排行" if today_flag else "累计积分排行"); start=page*15; body="\n".join(f"{start+i+1}. {list_name(r)} · {r['points']} " + tr(cs, "分", "points") for i,r in enumerate(rows)) or tr(cs, "暂无积分记录。", "No points recorded yet."); buttons=[]
         if page>0: buttons.append(InlineKeyboardButton("Previous" if english else "上一页",callback_data=f"rank:{cs}:{int(today_flag)}:{page-1}"))
         if start+len(rows)<total: buttons.append(InlineKeyboardButton("Next" if english else "下一页",callback_data=f"rank:{cs}:{int(today_flag)}:{page+1}"))
         rows=[buttons] if buttons else []
@@ -907,12 +946,34 @@ async def post_shutdown(application):
     store.close()
 
 
+async def error_handler(update, context):
+    exc = context.error
+    if isinstance(exc, BadRequest) and "not modified" in str(exc).lower():
+        return
+    logging.getLogger(__name__).error("Update processing failed", exc_info=(type(exc), exc, exc.__traceback__))
+
+
 def build_app(token):
-    app=Application.builder().token(token).post_init(post_init).post_shutdown(post_shutdown).build()
-    app.add_handler(CommandHandler("activate",activate)); app.add_handler(CommandHandler("score",score_cmd)); app.add_handler(CommandHandler("rank",lambda u,c:rank_cmd(u,c,False))); app.add_handler(CommandHandler("today",lambda u,c:rank_cmd(u,c,True))); app.add_handler(CommandHandler("addpoints",lambda u,c:points_cmd(u,c,"addpoints"))); app.add_handler(CommandHandler("subpoints",lambda u,c:points_cmd(u,c,"subpoints"))); app.add_handler(CommandHandler("start",start)); app.add_handler(CallbackQueryHandler(callback)); app.add_handler(MessageHandler(filters.Document.ALL,document_handler)); app.add_handler(MessageHandler(filters.TEXT,text_handler)); return app
+    app = (Application.builder().token(token).rate_limiter(AIORateLimiter(max_retries=3))
+           .post_init(post_init).post_shutdown(post_shutdown).build())
+    commands = {
+        "activate": activate, "score": score_cmd, "checkin": text_handler,
+        "rank": lambda u,c: rank_cmd(u,c,False), "today": lambda u,c: rank_cmd(u,c,True),
+        "addpoints": lambda u,c: points_cmd(u,c,"addpoints"),
+        "subpoints": lambda u,c: points_cmd(u,c,"subpoints"), "start": start,
+    }
+    for command, handler in commands.items():
+        app.add_handler(CommandHandler(command, handler, filters=filters.UpdateType.MESSAGE))
+    app.add_handler(CallbackQueryHandler(callback))
+    app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & filters.Document.ALL, document_handler))
+    app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & filters.TEXT, text_handler))
+    app.add_error_handler(error_handler)
+    return app
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     token=os.getenv("BOT_TOKEN")
     if not token: raise SystemExit("缺少 BOT_TOKEN 环境变量")
     if not OWNER_ID: raise SystemExit("缺少有效 OWNER_ID 环境变量")

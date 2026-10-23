@@ -75,11 +75,60 @@ class PointsTests(unittest.TestCase):
             self.assertEqual(member_identity(-1, 8), "No username (ID: 8)")
             self.assertEqual(member_identity(-1, 100), "ID: 100")
             history = adjustment_history(-1, 7)
-            for text in ("@alice", "@admin", "+10 分", "0 → 10", "活动奖励", "回复消息"):
+            for text in ("Alice", "Admin", "+10 分", "0 → 10", "活动奖励", "回复消息"):
                 self.assertIn(text, history)
             self.s.set_language(-1, "en")
-            self.assertIn("By: @admin", adjustment_history(-1, 7))
+            self.assertIn("By: Admin", adjustment_history(-1, 7))
             self.assertIn("Change: -2 points", adjustment_summary(-1, 7, -2))
+
+    def test_telegram_message_boundaries(self):
+        from bot import build_app, text_handler, addressed_to_other_bot, points_cmd
+        from telegram import Update, Message, Chat, User
+        from datetime import datetime, timezone
+        async def make_app():
+            return build_app("123:fake")
+        app = asyncio.run(make_app())
+        edited = Update(1, edited_message=Message(1, datetime.now(timezone.utc), Chat(-1, "supergroup"), text="/addpoints 10", from_user=User(7, "Alice", False)))
+        self.assertFalse(any(h.check_update(edited) for handlers in app.handlers.values() for h in handlers))
+        self.assertTrue(addressed_to_other_bot("/checkin@OtherBot", "MyBot"))
+        self.assertFalse(addressed_to_other_bot("/checkin@mYbOt", "MyBot"))
+        user = SimpleNamespace(id=7, username="alice", full_name="Alice", is_bot=False)
+        message = SimpleNamespace(from_user=user, sender_chat=None, text="/checkin@OtherBot", reply_text=AsyncMock())
+        update = SimpleNamespace(effective_message=message, effective_user=user, effective_chat=SimpleNamespace(id=-1, type="supergroup"))
+        context = SimpleNamespace(bot=SimpleNamespace(username="MyBot"))
+        with patch("bot.store", self.s):
+            asyncio.run(text_handler(update, context))
+            self.assertEqual(self.s.total(-1, 7), 0)
+            message.reply_text.assert_not_called()
+            for text in ("/checkin", "/checkin@MyBot"):
+                message.text=text
+                asyncio.run(text_handler(update, context))
+            self.assertEqual(self.s.total(-1, 7), 5)
+            message.text="hello world"
+            user.is_bot=True
+            asyncio.run(text_handler(update, context))
+            user.is_bot=False
+            message.sender_chat=SimpleNamespace(id=-1)
+            asyncio.run(text_handler(update, context))
+            asyncio.run(points_cmd(update, context, "addpoints"))
+            self.assertIn("关闭匿名", message.reply_text.call_args.args[0])
+            self.assertEqual(self.s.total(-1, 7), 5)
+
+    def test_lists_never_mention_and_error_logging(self):
+        from bot import list_name, error_handler, rank_cmd
+        from telegram.error import BadRequest
+        self.s.upsert_user(-1, 7, "alice", "Alice@work")
+        self.assertEqual(list_name(self.s.find_user(-1, "7")), "Alice＠work")
+        update=SimpleNamespace(effective_chat=SimpleNamespace(id=-1), effective_user=SimpleNamespace(id=7, is_bot=False), effective_message=SimpleNamespace(sender_chat=None, reply_text=AsyncMock()))
+        with patch("bot.store", self.s):
+            asyncio.run(rank_cmd(update, None))
+            self.assertNotIn("@", update.effective_message.reply_text.call_args.args[0])
+            self.assertNotIn("@", adjustment_history(-1, 7))
+        with patch("bot.logging.getLogger") as logger:
+            asyncio.run(error_handler(None, SimpleNamespace(error=BadRequest("Message is not modified"))))
+            logger.assert_not_called()
+            asyncio.run(error_handler(None, SimpleNamespace(error=RuntimeError("failure"))))
+            self.assertIn("exc_info", logger.return_value.error.call_args.kwargs)
 
     def test_adjustment_history_pages_do_not_skip_entries(self):
         self.s.upsert_user(-1, 7, "alice", "Alice")
