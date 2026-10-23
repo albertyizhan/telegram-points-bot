@@ -59,12 +59,12 @@ COMMANDS = [
 ]
 
 
-def now(tz_name=DEFAULT_TIMEZONE):
-    return datetime.now(timezone_for(tz_name)).isoformat(timespec="seconds")
+def now(tz_name=DEFAULT_TIMEZONE, now_fn=None):
+    return (now_fn or datetime.now)(timezone_for(tz_name)).isoformat(timespec="seconds")
 
 
-def day(tz_name=DEFAULT_TIMEZONE):
-    return datetime.now(timezone_for(tz_name)).date().isoformat()
+def day(tz_name=DEFAULT_TIMEZONE, now_fn=None):
+    return (now_fn or datetime.now)(timezone_for(tz_name)).date().isoformat()
 
 
 def timezone_for(name):
@@ -98,13 +98,15 @@ def tr_error(chat_id, message):
 
 
 class Store:
-    def __init__(self, path=DB_PATH):
-        self.conn = sqlite3.connect(path, timeout=30, check_same_thread=False)
+    def __init__(self, path=DB_PATH, now_fn=None):
+        self.path = os.fspath(path)
+        self.now_fn = now_fn
+        self.conn = sqlite3.connect(path, timeout=5, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
-        self.conn.execute("PRAGMA busy_timeout=30000")
+        self.conn.execute("PRAGMA busy_timeout=5000")
         self.init()
 
     def init(self):
@@ -123,14 +125,39 @@ class Store:
             CREATE TABLE IF NOT EXISTS chat_migrations(old_id INTEGER PRIMARY KEY, new_id INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS message_fingerprints(chat_id INTEGER,user_id INTEGER,fingerprint TEXT,created_at TEXT NOT NULL,PRIMARY KEY(chat_id,user_id,fingerprint));
             """)
-            for table, column, definition in (
-                ("chats", "authorized_by", "INTEGER"),
-                ("settings", "language", "TEXT NOT NULL DEFAULT 'zh'"),
-                ("settings", "timezone", "TEXT NOT NULL DEFAULT 'Asia/Hong_Kong'"),
-                ("adjustments", "reason", "TEXT NOT NULL DEFAULT ''"),
-            ):
-                try: self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-                except sqlite3.OperationalError: pass
+            self.conn.commit()
+            version = self.conn.execute("PRAGMA user_version").fetchone()[0]
+            if version > 2: raise ValueError("数据库版本高于当前程序支持的版本")
+            if version < 2 and self.conn.execute("SELECT 1 FROM chats LIMIT 1").fetchone():
+                from pathlib import Path
+                directory=Path(self.path).resolve().parent / "backups"
+                directory.mkdir(exist_ok=True)
+                self.backup(str(directory / ("pre-migration-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f") + ".db")))
+            if version < 1:
+                with self.conn:
+                    self.conn.execute("BEGIN IMMEDIATE")
+                    for table, column, definition in (
+                        ("chats", "authorized_by", "INTEGER"),
+                        ("settings", "language", "TEXT NOT NULL DEFAULT 'zh'"),
+                        ("settings", "timezone", "TEXT NOT NULL DEFAULT 'Asia/Hong_Kong'"),
+                        ("adjustments", "reason", "TEXT NOT NULL DEFAULT ''"),
+                    ):
+                        if column not in {r[1] for r in self.conn.execute(f"PRAGMA table_info({table})")}:
+                            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+                    self.conn.execute("PRAGMA user_version=1")
+            if version < 2:
+                with self.conn:
+                    self.conn.execute("BEGIN IMMEDIATE")
+                    if "reverts_id" not in {r[1] for r in self.conn.execute("PRAGMA table_info(adjustments)")}:
+                        self.conn.execute("ALTER TABLE adjustments ADD COLUMN reverts_id INTEGER REFERENCES adjustments(id)")
+                    for r in self.conn.execute("SELECT id,chat_id,reason FROM adjustments WHERE method='undo' ORDER BY id").fetchall():
+                        match=re.fullmatch(r"撤销调整 #([0-9]+)",r["reason"])
+                        if match and self.conn.execute("SELECT 1 FROM adjustments WHERE id=? AND chat_id=?",(int(match[1]),r["chat_id"])).fetchone():
+                            if not self.conn.execute("SELECT 1 FROM adjustments WHERE reverts_id=?",(int(match[1]),)).fetchone():
+                                self.conn.execute("UPDATE adjustments SET reverts_id=? WHERE id=?",(int(match[1]),r["id"]))
+                    self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_adjustments_reverts ON adjustments(reverts_id) WHERE reverts_id IS NOT NULL")
+                    self.conn.execute("DELETE FROM message_fingerprints")
+                    self.conn.execute("PRAGMA user_version=2")
             # Migrate old one-group code bindings to the new one-license-per-person model.
             self.conn.execute("INSERT OR IGNORE INTO settings(chat_id) SELECT chat_id FROM chats")
             self.conn.execute("INSERT OR IGNORE INTO licenses(user_id,code_hash,bound_at) SELECT used_by,code_hash,COALESCE(used_at,created_at) FROM auth_codes WHERE used_by IS NOT NULL")
@@ -162,10 +189,10 @@ class Store:
                     h = hashlib.sha256(code.encode()).hexdigest()
                     r = self.conn.execute("SELECT used_at FROM auth_codes WHERE code_hash=?", (h,)).fetchone()
                     if not r or r[0]: return False
-                    self.conn.execute("INSERT INTO licenses(user_id,code_hash,bound_at) VALUES(?,?,?)", (user_id,h,now()))
-                    self.conn.execute("UPDATE auth_codes SET used_at=?,used_by=?,used_chat_id=? WHERE code_hash=? AND used_at IS NULL", (now(),user_id,chat_id,h))
+                    self.conn.execute("INSERT INTO licenses(user_id,code_hash,bound_at) VALUES(?,?,?)", (user_id,h,now(now_fn=self.now_fn)))
+                    self.conn.execute("UPDATE auth_codes SET used_at=?,used_by=?,used_chat_id=? WHERE code_hash=? AND used_at IS NULL", (now(now_fn=self.now_fn),user_id,chat_id,h))
             self.conn.execute("DELETE FROM chat_departures WHERE chat_id=?", (chat_id,))
-            t = now()
+            t = now(now_fn=self.now_fn)
             self.conn.execute("INSERT INTO chats(chat_id,title,enabled,created_at,authorized_by) VALUES(?,?,1,?,?) ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title,enabled=1,authorized_by=excluded.authorized_by", (chat_id,title,t,user_id))
             self.conn.execute("INSERT OR IGNORE INTO settings(chat_id) VALUES(?)", (chat_id,))
             return True
@@ -173,7 +200,7 @@ class Store:
     def generate_code(self):
         code = secrets.token_urlsafe(12)
         with self.conn:
-            self.conn.execute("INSERT INTO auth_codes(code_hash,created_at) VALUES(?,?)", (hashlib.sha256(code.encode()).hexdigest(), now()))
+            self.conn.execute("INSERT INTO auth_codes(code_hash,created_at) VALUES(?,?)", (hashlib.sha256(code.encode()).hexdigest(), now(now_fn=self.now_fn)))
         return code
 
     def unused_codes(self):
@@ -248,11 +275,11 @@ class Store:
 
     def local_day(self, chat_id):
         s = self.settings(chat_id)
-        return day(s["timezone"] if s else DEFAULT_TIMEZONE)
+        return day(s["timezone"] if s else DEFAULT_TIMEZONE, self.now_fn)
 
     def chat_now(self, chat_id):
         s = self.settings(chat_id)
-        return now(s["timezone"] if s else DEFAULT_TIMEZONE)
+        return now(s["timezone"] if s else DEFAULT_TIMEZONE, self.now_fn)
 
     def resolve_alias(self, chat_id, text):
         clean = text.strip()
@@ -284,12 +311,9 @@ class Store:
         if not s or not s[0]: return 0
         count = len(re.sub(r"\s", "", text, flags=re.UNICODE))
         if not count or (s["min_chars"] and count < s["min_chars"]): return 0
-        current_day = day(s["timezone"])
-        timestamp = now(s["timezone"])
+        current_day = day(s["timezone"], self.now_fn)
+        timestamp = now(s["timezone"], self.now_fn)
         with db_lock, self.conn:
-            fingerprint = hashlib.sha256(text.strip().casefold().encode()).hexdigest()
-            # Keep fingerprints for future anti-spam reporting; scoring remains configurable by daily limit.
-            self.conn.execute("INSERT OR REPLACE INTO message_fingerprints VALUES(?,?,?,?)", (chat_id,user_id,fingerprint,timestamp))
             self.conn.execute("INSERT INTO users(chat_id,user_id,username,display_name,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(chat_id,user_id) DO UPDATE SET username=excluded.username,display_name=excluded.display_name,updated_at=excluded.updated_at", (chat_id,user_id,username,display_name,timestamp))
             self.conn.execute("INSERT INTO daily(chat_id,user_id,day) VALUES(?,?,?) ON CONFLICT DO NOTHING", (chat_id,user_id,current_day))
             if s["daily_limit"]:
@@ -304,8 +328,8 @@ class Store:
         s = self.conn.execute("SELECT c.enabled,s.checkin_points,s.timezone FROM chats c JOIN settings s ON s.chat_id=c.chat_id WHERE c.chat_id=?", (chat_id,)).fetchone()
         if not s or not s[0]: return (False,0,0)
         points = s["checkin_points"]
-        current_day = day(s["timezone"])
-        timestamp = now(s["timezone"])
+        current_day = day(s["timezone"], self.now_fn)
+        timestamp = now(s["timezone"], self.now_fn)
         with db_lock, self.conn:
             self.conn.execute("INSERT INTO users(chat_id,user_id,username,display_name,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(chat_id,user_id) DO UPDATE SET username=excluded.username,display_name=excluded.display_name,updated_at=excluded.updated_at", (chat_id,user_id,username,display_name,timestamp))
             self.conn.execute("INSERT INTO daily(chat_id,user_id,day) VALUES(?,?,?) ON CONFLICT DO NOTHING", (chat_id,user_id,current_day))
@@ -327,26 +351,30 @@ class Store:
         q=query.lstrip("@").lower(); rows=self.conn.execute("SELECT * FROM users WHERE chat_id=? AND lower(username)=?", (chat_id,q)).fetchall()
         return rows[0] if len(rows)==1 else (None if not rows else "conflict")
 
-    def adjust(self, chat_id, operator_id, target_id, delta, method, reason=""):
+    def _adjust(self, chat_id, operator_id, target_id, delta, method, reason="", reverts_id=None):
         if not 1 <= abs(delta) <= 1000000: raise ValueError("数量必须是 1 到 1000000 的整数")
         if not self.authorized(chat_id): raise ValueError("本群尚未激活积分功能")
+        r=self.conn.execute("SELECT total_points FROM users WHERE chat_id=? AND user_id=?",(chat_id,target_id)).fetchone()
+        if not r: raise ValueError("用户需要先在群里发言")
+        before=r[0]; after=before+delta
+        if after<0: raise ValueError("积分不能低于 0")
+        self.conn.execute("UPDATE users SET total_points=?,updated_at=? WHERE chat_id=? AND user_id=?",(after,self.chat_now(chat_id),chat_id,target_id))
+        self.conn.execute("INSERT INTO adjustments(chat_id,operator_id,target_id,delta,before_points,after_points,method,created_at,reason,reverts_id) VALUES(?,?,?,?,?,?,?,?,?,?)",(chat_id,operator_id,target_id,delta,before,after,method,self.chat_now(chat_id),reason[:200],reverts_id))
+        return before,after
+
+    def adjust(self, chat_id, operator_id, target_id, delta, method, reason=""):
         with db_lock, self.conn:
-            r=self.conn.execute("SELECT total_points FROM users WHERE chat_id=? AND user_id=?", (chat_id,target_id)).fetchone()
-            if not r: raise ValueError("用户需要先在群里发言")
-            before=r[0]; after=before+delta
-            if after<0: raise ValueError("积分不能低于 0")
-            self.conn.execute("UPDATE users SET total_points=?,updated_at=? WHERE chat_id=? AND user_id=?", (after,self.chat_now(chat_id),chat_id,target_id))
-            self.conn.execute("INSERT INTO adjustments(chat_id,operator_id,target_id,delta,before_points,after_points,method,created_at,reason) VALUES(?,?,?,?,?,?,?,?,?)", (chat_id,operator_id,target_id,delta,before,after,method,self.chat_now(chat_id),reason[:200]))
-            return before,after
+            self.conn.execute("BEGIN IMMEDIATE")
+            return self._adjust(chat_id,operator_id,target_id,delta,method,reason)
 
     def undo_adjustment(self, chat_id, operator_id, adjustment_id):
         with db_lock, self.conn:
-            row = self.conn.execute("SELECT target_id,delta,method FROM adjustments WHERE id=? AND chat_id=?", (adjustment_id,chat_id)).fetchone()
+            self.conn.execute("BEGIN IMMEDIATE")
+            row=self.conn.execute("SELECT target_id,delta,method,reverts_id FROM adjustments WHERE id=? AND chat_id=?",(adjustment_id,chat_id)).fetchone()
             if not row: raise ValueError("找不到该调整记录")
-            reason = "撤销调整 #" + str(adjustment_id)
-            if row["method"] == "undo" or self.conn.execute("SELECT 1 FROM adjustments WHERE chat_id=? AND method='undo' AND reason=?", (chat_id, reason)).fetchone():
-                raise ValueError("该记录已撤销或属于撤销记录")
-            return self.adjust(chat_id, operator_id, row[0], -row[1], "undo", reason)
+            if row["reverts_id"] is not None or row["method"] in ("undo","import") or self.conn.execute("SELECT 1 FROM adjustments WHERE reverts_id=?",(adjustment_id,)).fetchone():
+                raise ValueError("该记录已撤销或属于不可撤销记录")
+            return self._adjust(chat_id,operator_id,row[0],-row[1],"undo",f"撤销调整 #{adjustment_id}",adjustment_id)
 
     def recent(self, chat_id, user_id, page=0, size=20):
         return self.conn.execute("SELECT * FROM adjustments WHERE chat_id=? AND target_id=? ORDER BY id DESC LIMIT ? OFFSET ?", (chat_id,user_id,size,page*size)).fetchall()
@@ -882,7 +910,7 @@ async def callback_action(update, context):
         nav=[]
         if page: nav.append(InlineKeyboardButton(tr(cs, "上一页", "Previous"), callback_data=f"recent:{cs}:{us}:{page-1}"))
         if store.recent(cs, us, page+1, 5): nav.append(InlineKeyboardButton(tr(cs, "下一页", "Next"), callback_data=f"recent:{cs}:{us}:{page+1}"))
-        undo_buttons = [[InlineKeyboardButton(tr(cs, f"撤销记录 #{r['id']}", f"Undo entry #{r['id']}"), callback_data=f"undo_recent:{cs}:{us}:{r['id']}")] for r in rows if r["method"] != "undo" and not store.conn.execute("SELECT 1 FROM adjustments WHERE chat_id=? AND method='undo' AND reason=?", (cs, f"撤销调整 #{r['id']}")).fetchone()]
+        undo_buttons = [[InlineKeyboardButton(tr(cs, f"撤销记录 #{r['id']}", f"Undo entry #{r['id']}"), callback_data=f"undo_recent:{cs}:{us}:{r['id']}")] for r in rows if r["method"] not in ("undo","import") and not store.conn.execute("SELECT 1 FROM adjustments WHERE reverts_id=?", (r["id"],)).fetchone()]
         buttons=([nav] if nav else []) + undo_buttons + [[InlineKeyboardButton(tr(cs, "返回成员", "Back to member"), callback_data=f"member:{cs}:{us}")]]
         return await q.edit_message_text(adjustment_history(cs, us, page), reply_markup=InlineKeyboardMarkup(buttons))
     if data.startswith("undo_recent:"):

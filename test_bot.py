@@ -244,6 +244,42 @@ class PointsTests(unittest.TestCase):
         self.assertTrue(self.s.authorized(-2))
         self.assertEqual(self.s.conn.execute("PRAGMA foreign_key_check").fetchall(), [])
 
+    def test_versioned_migration_old_schema_and_clock(self):
+        from datetime import datetime, timezone
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/"legacy.db"
+            with sqlite3.connect(path) as conn:
+                conn.executescript("CREATE TABLE chats(chat_id INTEGER PRIMARY KEY,title TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL); INSERT INTO chats VALUES(-1,'old',1,'2026-01-01'); CREATE TABLE settings(chat_id INTEGER PRIMARY KEY,min_chars INTEGER NOT NULL DEFAULT 5,daily_limit INTEGER NOT NULL DEFAULT 20,checkin_points INTEGER NOT NULL DEFAULT 5);")
+            fixed=lambda tz: datetime(2026,3,8,7,1,tzinfo=timezone.utc).astimezone(tz)
+            migrated=Store(path,now_fn=fixed)
+            try:
+                self.assertEqual(migrated.conn.execute("PRAGMA user_version").fetchone()[0],2)
+                self.assertEqual(len(list((Path(tmp)/"backups").glob("*.db"))),1)
+                migrated.init()
+                self.assertEqual(len(list((Path(tmp)/"backups").glob("*.db"))),1)
+                migrated.set_timezone(-1,"America/New_York")
+                self.assertIn("2026-03-08T03:01:00-04:00",migrated.chat_now(-1))
+                self.assertEqual(migrated.local_day(-1),"2026-03-08")
+                self.assertEqual(migrated.conn.execute("PRAGMA busy_timeout").fetchone()[0],5000)
+            finally: migrated.close()
+
+    def test_concurrent_adjustments_never_overdraw(self):
+        from concurrent.futures import ThreadPoolExecutor
+        self.s.upsert_user(-1,7,None,"Alice")
+        self.s.adjust(-1,99,7,1,"reply")
+        other=Store(self.tmp.name)
+        def deduct(store):
+            try: store.adjust(-1,99,7,-1,"reply"); return True
+            except ValueError: return False
+        try:
+            with ThreadPoolExecutor(2) as pool:
+                results=list(pool.map(deduct,[self.s,other]))
+            self.assertEqual(sum(results),1)
+            self.assertEqual(self.s.total(-1,7),0)
+            self.assertEqual(self.s.conn.execute("SELECT count(*) FROM message_fingerprints").fetchone()[0],0)
+        finally: other.close()
+
     def test_private_flows_search_cancel_undo_and_ranking(self):
         self.s.upsert_user(-1, 7, "alice", "Alice")
         self.s.adjust(-1, 99, 7, 10, "reply")
