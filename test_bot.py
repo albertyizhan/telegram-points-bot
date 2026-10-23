@@ -254,7 +254,7 @@ class PointsTests(unittest.TestCase):
             fixed=lambda tz: datetime(2026,3,8,7,1,tzinfo=timezone.utc).astimezone(tz)
             migrated=Store(path,now_fn=fixed)
             try:
-                self.assertEqual(migrated.conn.execute("PRAGMA user_version").fetchone()[0],3)
+                self.assertEqual(migrated.conn.execute("PRAGMA user_version").fetchone()[0],4)
                 self.assertEqual(len(list((Path(tmp)/"backups").glob("*.db"))),1)
                 migrated.init()
                 self.assertEqual(len(list((Path(tmp)/"backups").glob("*.db"))),1)
@@ -338,6 +338,81 @@ class PointsTests(unittest.TestCase):
                 data=button.callback_data.replace("-1","-1009999999999")
                 self.assertLessEqual(len(data.encode()),64)
         self.assertLessEqual(len(f"delalias:-1009999999999:{alias_key('中'*16)}".encode()),64)
+
+    def test_license_revocation_expiry_invalidation_and_limit(self):
+        from datetime import datetime,timezone,timedelta
+        fixed=datetime(2026,1,1,tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            s=Store(os.path.join(tmp,"licenses.db"),now_fn=lambda tz:fixed.astimezone(tz))
+            try:
+                code=s.generate_code()
+                fixed+=timedelta(days=31)
+                self.assertFalse(s.authorize(-1,"one",code,10))
+                valid=s.generate_code()
+                self.assertTrue(s.invalidate_code(s.unused_codes()[0]["hash"]))
+                self.assertFalse(s.authorize(-1,"one",valid,10))
+                active=s.generate_code()
+                with patch("bot.MAX_CHATS_PER_LICENSE",1):
+                    self.assertTrue(s.authorize(-1,"one",active,10))
+                    self.assertFalse(s.authorize(-2,"two",None,10))
+                    s.revoke(-1)
+                    self.assertTrue(s.authorize(-2,"two",None,10))
+                s.upsert_user(-2,7,None,"Alice")
+                self.assertTrue(s.revoke_license(10))
+                self.assertFalse(s.authorized(-2))
+                self.assertFalse(s.authorize(-3,"three",None,10))
+                self.assertFalse(s.authorize(-3,"three",active,10))
+                self.assertIsNotNone(s.find_user(-2,"7"))
+            finally:s.close()
+
+    def test_legacy_alias_conflicts_and_codes_preserved(self):
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/"legacy.db"
+            s=Store(path)
+            s.authorize(-1,"one",None,99,owner=True)
+            with s.conn:
+                s.conn.execute("INSERT INTO aliases VALUES(-1,'score','Ok')")
+                s.conn.execute("INSERT INTO aliases VALUES(-1,'checkin','ok')")
+                s.conn.execute("PRAGMA user_version=2")
+            s.close()
+            with patch("bot.logging.getLogger"):
+                s=Store(path)
+            try:
+                self.assertEqual([(r["action"],r["alias"]) for r in s.aliases(-1)],[("score","ok")])
+                self.assertEqual(s.conn.execute("PRAGMA foreign_key_check").fetchall(),[])
+            finally:s.close()
+
+    def test_concurrent_confirmation_consumed_once(self):
+        from bot import confirmation
+        self.s.upsert_user(-1,7,None,"Alice")
+        user=SimpleNamespace(id=99,username="admin",full_name="Admin")
+        context=SimpleNamespace(user_data={})
+        data=confirmation(context,"adjust",(7,10,""),-1).inline_keyboard[0][0].callback_data
+        q=SimpleNamespace(data=data,from_user=user,answer=AsyncMock(),edit_message_text=AsyncMock())
+        update=SimpleNamespace(callback_query=q,effective_user=user,effective_chat=SimpleNamespace(type="private"))
+        async def permission(*args):
+            await asyncio.sleep(0)
+            return True
+        async def click():
+            await asyncio.gather(callback(update,context),callback(update,context))
+        with patch("bot.store",self.s),patch("bot.is_admin",new=permission):
+            asyncio.run(click())
+        self.assertEqual(self.s.total(-1,7),10)
+        self.assertEqual(len(self.s.recent(-1,7)),1)
+
+    def test_admin_permissions_cached_for_sixty_seconds(self):
+        from bot import admin_level,_admin_cache
+        _admin_cache.clear()
+        api=AsyncMock(return_value=SimpleNamespace(status="administrator",can_promote_members=True))
+        update=SimpleNamespace(effective_user=SimpleNamespace(id=77),effective_chat=SimpleNamespace(id=-1),get_bot=lambda:SimpleNamespace(get_chat_member=api))
+        with patch("bot.time.monotonic",return_value=0):
+            self.assertEqual(asyncio.run(admin_level(update)),2)
+            self.assertEqual(asyncio.run(admin_level(update)),2)
+        api.assert_awaited_once()
+        with patch("bot.time.monotonic",return_value=61): asyncio.run(admin_level(update))
+        self.assertEqual(api.await_count,2)
+        _admin_cache.clear()
 
     def test_private_flows_search_cancel_undo_and_ranking(self):
         self.s.upsert_user(-1, 7, "alice", "Alice")

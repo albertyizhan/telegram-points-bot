@@ -53,6 +53,9 @@ SETTING_LABELS = {
 }
 DB_PATH = os.getenv("DB_PATH", "points.db")
 OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
+MAX_CHATS_PER_LICENSE = int(os.getenv("MAX_CHATS_PER_LICENSE", "3"))
+AUTH_CODE_TTL_DAYS = int(os.getenv("AUTH_CODE_TTL_DAYS", "30"))
+if MAX_CHATS_PER_LICENSE<1 or AUTH_CODE_TTL_DAYS<1: raise ValueError("授权群数与激活码有效天数必须大于 0")
 db_lock = threading.RLock()
 COMMANDS = [
     BotCommand("start", "管理群组积分和规则 / Manage groups and points"),
@@ -134,8 +137,8 @@ class Store:
             """)
             self.conn.commit()
             version = self.conn.execute("PRAGMA user_version").fetchone()[0]
-            if version > 3: raise ValueError("数据库版本高于当前程序支持的版本")
-            if version < 3 and self.conn.execute("SELECT 1 FROM chats LIMIT 1").fetchone():
+            if version > 4: raise ValueError("数据库版本高于当前程序支持的版本")
+            if version < 4 and self.conn.execute("SELECT 1 FROM chats LIMIT 1").fetchone():
                 from pathlib import Path
                 directory=Path(self.path).resolve().parent / "backups"
                 directory.mkdir(exist_ok=True)
@@ -169,18 +172,27 @@ class Store:
                 with self.conn:
                     self.conn.execute("BEGIN IMMEDIATE")
                     rows=self.conn.execute("SELECT rowid,* FROM aliases ORDER BY rowid").fetchall()
-                    seen=set()
+                    seen=set(); kept=[]
                     for row in rows:
                         normalized=row["alias"].lower()
                         key=(row["chat_id"],normalized)
                         if key in seen:
                             logging.getLogger(__name__).warning("Duplicate alias removed in group %s: %s",*key)
-                            self.conn.execute("DELETE FROM aliases WHERE rowid=?",(row["rowid"],))
                         else:
-                            self.conn.execute("UPDATE aliases SET alias=? WHERE rowid=?",(normalized,row["rowid"]))
-                            seen.add(key)
+                            kept.append((row["chat_id"],row["action"],normalized)); seen.add(key)
+                    # Rebuild rows inside this transaction to avoid case-fold collisions
+                    # with a later row that has not yet been normalized.
+                    self.conn.execute("DELETE FROM aliases")
+                    self.conn.executemany("INSERT INTO aliases(chat_id,action,alias) VALUES(?,?,?)",kept)
                     self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_aliases_unique ON aliases(chat_id,alias)")
                     self.conn.execute("PRAGMA user_version=3")
+            if version < 4:
+                with self.conn:
+                    self.conn.execute("BEGIN IMMEDIATE")
+                    for table,column in (("licenses","revoked_at"),("auth_codes","expires_at"),("auth_codes","invalidated_at")):
+                        if column not in {r[1] for r in self.conn.execute(f"PRAGMA table_info({table})")}:
+                            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+                    self.conn.execute("PRAGMA user_version=4")
             # Migrate old one-group code bindings to the new one-license-per-person model.
             self.conn.execute("INSERT OR IGNORE INTO settings(chat_id) SELECT chat_id FROM chats")
             self.conn.execute("INSERT OR IGNORE INTO licenses(user_id,code_hash,bound_at) SELECT used_by,code_hash,COALESCE(used_at,created_at) FROM auth_codes WHERE used_by IS NOT NULL")
@@ -201,17 +213,20 @@ class Store:
 
     def authorize(self, chat_id, title, code, user_id, owner=False):
         with db_lock, self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
             if self.authorized(chat_id): return False
             if not owner:
-                if self.conn.execute("SELECT COUNT(*) FROM chats WHERE enabled=1 AND authorized_by=?", (user_id,)).fetchone()[0] >= 3: return False
-                license_row = self.conn.execute("SELECT code_hash FROM licenses WHERE user_id=?", (user_id,)).fetchone()
+                if self.conn.execute("SELECT COUNT(*) FROM chats WHERE enabled=1 AND authorized_by=?", (user_id,)).fetchone()[0] >= MAX_CHATS_PER_LICENSE: return False
+                license_row = self.conn.execute("SELECT code_hash,revoked_at FROM licenses WHERE user_id=?", (user_id,)).fetchone()
                 if license_row:
+                    if license_row["revoked_at"]: return False
                     if code and hashlib.sha256(code.encode()).hexdigest() != license_row[0]: return False
                 else:
                     if not code: return False
                     h = hashlib.sha256(code.encode()).hexdigest()
-                    r = self.conn.execute("SELECT used_at FROM auth_codes WHERE code_hash=?", (h,)).fetchone()
-                    if not r or r[0]: return False
+                    r = self.conn.execute("SELECT used_at,expires_at,invalidated_at FROM auth_codes WHERE code_hash=?", (h,)).fetchone()
+                    if not r or r[0] or r["invalidated_at"]: return False
+                    if r["expires_at"] and datetime.fromisoformat(r["expires_at"]) <= datetime.fromisoformat(now(now_fn=self.now_fn)): return False
                     self.conn.execute("INSERT INTO licenses(user_id,code_hash,bound_at) VALUES(?,?,?)", (user_id,h,now(now_fn=self.now_fn)))
                     self.conn.execute("UPDATE auth_codes SET used_at=?,used_by=?,used_chat_id=? WHERE code_hash=? AND used_at IS NULL", (now(now_fn=self.now_fn),user_id,chat_id,h))
             self.conn.execute("DELETE FROM chat_departures WHERE chat_id=?", (chat_id,))
@@ -223,18 +238,36 @@ class Store:
     def generate_code(self):
         code = secrets.token_urlsafe(12)
         with self.conn:
-            self.conn.execute("INSERT INTO auth_codes(code_hash,created_at) VALUES(?,?)", (hashlib.sha256(code.encode()).hexdigest(), now(now_fn=self.now_fn)))
+            self.conn.execute("INSERT INTO auth_codes(code_hash,created_at,expires_at) VALUES(?,?,?)", (hashlib.sha256(code.encode()).hexdigest(), now(now_fn=self.now_fn), (datetime.fromisoformat(now(now_fn=self.now_fn))+timedelta(days=AUTH_CODE_TTL_DAYS)).isoformat()))
         return code
 
     def unused_codes(self):
-        return self.conn.execute("SELECT created_at,substr(code_hash,1,12) AS hash FROM auth_codes WHERE used_at IS NULL ORDER BY created_at DESC").fetchall()
+        timestamp=now(now_fn=self.now_fn)
+        return [r for r in self.conn.execute("SELECT created_at,expires_at,substr(code_hash,1,12) AS hash FROM auth_codes WHERE used_at IS NULL AND invalidated_at IS NULL ORDER BY created_at DESC") if not r["expires_at"] or datetime.fromisoformat(r["expires_at"])>datetime.fromisoformat(timestamp)]
+
+    def invalidate_code(self, short_hash):
+        with self.conn:
+            rows=self.conn.execute("SELECT code_hash FROM auth_codes WHERE substr(code_hash,1,12)=? AND used_at IS NULL AND invalidated_at IS NULL",(short_hash,)).fetchall()
+            if len(rows)!=1: return False
+            return bool(self.conn.execute("UPDATE auth_codes SET invalidated_at=? WHERE code_hash=? AND used_at IS NULL",(now(now_fn=self.now_fn),rows[0][0])).rowcount)
+
+    def revoke_license(self, user_id):
+        with db_lock,self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            cursor=self.conn.execute("UPDATE licenses SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL",(now(now_fn=self.now_fn),user_id))
+            if cursor.rowcount:
+                self.conn.execute("UPDATE chats SET enabled=0 WHERE authorized_by=?",(user_id,))
+                self.conn.execute("UPDATE chat_departures SET was_enabled=0 WHERE chat_id IN (SELECT chat_id FROM chats WHERE authorized_by=?)",(user_id,))
+            return bool(cursor.rowcount)
 
     def chats(self, enabled_only=True):
         q = "SELECT * FROM chats" + (" WHERE enabled=1" if enabled_only else "") + " ORDER BY title"
         return self.conn.execute(q).fetchall()
 
     def revoke(self, chat_id):
-        with self.conn: self.conn.execute("UPDATE chats SET enabled=0 WHERE chat_id=?", (chat_id,))
+        with self.conn:
+            self.conn.execute("UPDATE chats SET enabled=0 WHERE chat_id=?", (chat_id,))
+            self.conn.execute("UPDATE chat_departures SET was_enabled=0 WHERE chat_id=?", (chat_id,))
 
     def migrate_chat(self, old_id, new_id):
         """Move the whole group atomically; never merge two existing groups."""
@@ -457,6 +490,7 @@ class Store:
             if not d.get("checked_in", 0) and d.get("checkin_points", 0): raise ValueError("未签到的记录不能包含签到奖励")
         count = 0
         with db_lock, self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
             settings = data.get("settings")
             if isinstance(settings, dict):
                 values = [settings.get(key, default) for key, default in (("min_chars", 5), ("daily_limit", 20), ("checkin_points", 5))]
@@ -536,6 +570,8 @@ async def admin_level(update, chat_id=None):
         if member.status == "creator": level=3
         elif member.status == "administrator": level=2 if member.can_promote_members else 1
     except Exception: return 0
+    for expired in [k for k,v in _admin_cache.items() if v[0]<=time.monotonic()]:
+        _admin_cache.pop(expired,None)
     _admin_cache[key]=(time.monotonic()+60,level)
     return level
 
@@ -565,7 +601,7 @@ def list_identity(cid, uid):
 
 
 def addressed_to_other_bot(text, bot_username):
-    command = (text or "").split(None, 1)[0] if (text or "").strip() else ""
+    command = (text or "").strip().split(None, 1)[0] if (text or "").strip() else ""
     return command.startswith("/") and "@" in command and command.split("@", 1)[1].casefold() != (bot_username or "").casefold()
 
 
@@ -641,7 +677,7 @@ async def activate(update, context):
     if not await is_admin(update, minimum=1): return await m.reply_text("只有群主或管理员可以激活本群积分功能。")
     code = context.args[0] if context.args else None
     ok=store.authorize(update.effective_chat.id,update.effective_chat.title or str(update.effective_chat.id),code,update.effective_user.id)
-    await m.reply_text("本群积分功能已激活。你绑定的激活码还可用于最多 3 个群。" if ok else ("你已有绑定激活码，请直接发送 /activate；每人最多激活 3 个群。" if not code else "激活码无效、已被其他人使用，或本群已经激活。"))
+    await m.reply_text(f"本群积分功能已激活。每个授权最多同时激活 {MAX_CHATS_PER_LICENSE} 个群。" if ok else (f"如已有有效授权，请直接发送 /activate；每人最多激活 {MAX_CHATS_PER_LICENSE} 个群。" if not code else "激活码无效、已被其他人使用，或本群已经激活。"))
 
 
 async def document_handler(update, context):
@@ -706,7 +742,7 @@ async def points_cmd(update, context, action=None):
     if not target: return await m.reply_text(tr(cid,"找不到目标成员；请回复其群消息，或使用已记录的完整用户名。","Member not found. Reply to their message or use a recorded exact username."))
     target_id = target.id if hasattr(target, "id") else target["user_id"]
     target_name = who(target)
-    if getattr(target,"is_bot",False): return await m.reply_text(tr(cid,"不能调整机器人积分。","Bot accounts cannot have points adjusted."))
+    if (m.reply_to_message and getattr(m.reply_to_message,"sender_chat",None)) or getattr(target,"is_bot",False): return await m.reply_text(tr(cid,"不能调整机器人积分。","Bot accounts cannot have points adjusted."))
     store.upsert_user(cid, update.effective_user.id, update.effective_user.username, update.effective_user.full_name)
     if hasattr(target, "full_name"):
         store.upsert_user(cid, target_id, target.username, target.full_name)
@@ -770,7 +806,7 @@ def owner_authorized_keyboard(page=0):
 
 
 def owner_home_keyboard():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("我的群组",callback_data="ownergroups")],[InlineKeyboardButton("已激活群组",callback_data="ownerauthorized")],[InlineKeyboardButton("生成激活码",callback_data="code"),InlineKeyboardButton("激活码列表",callback_data="codes")]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("授权列表 / 吊销授权",callback_data="licenses:0")],[InlineKeyboardButton("我的群组",callback_data="ownergroups")],[InlineKeyboardButton("已激活群组",callback_data="ownerauthorized")],[InlineKeyboardButton("生成激活码",callback_data="code"),InlineKeyboardButton("激活码列表",callback_data="codes")]])
 
 
 def back_keyboard(cid=None, parent=None, zh="返回上级菜单", en="Back"):
@@ -814,12 +850,13 @@ async def group_page(update, chat_id):
 # Prefix -> (required role, route). Parsing is centralized before dispatch.
 CALLBACK_ROLES = {
     **{p: "public" for p in ("noop", "home")},
-    **{p: "owner" for p in ("ownergroups", "ownerauthorized", "owner_auth_page", "ownersearch", "ownersearch_auth", "code", "codes", "revokeask", "revokeyes")},
+    **{p: "owner" for p in ("ownergroups", "ownerauthorized", "owner_auth_page", "ownersearch", "ownersearch_auth", "code", "codes", "licenses", "licenseask", "invalidate", "revokeask", "revokeyes")},
     **{p: "admin1" for p in ("g", "search", "member", "adjust", "recent", "undo_recent", "undo_confirm", "stat", "custom")},
     **{p: "admin2" for p in ("set", "edit", "alias", "addalias", "delalias", "lang", "tz", "tzlist", "export", "import", "imports")},
     "rank": "member", "confirm": "pending", "cancel": "pending",
 }
 CALLBACK_PATTERNS = {
+    "codes": r"codes(?::[0-9]+)?", "licenses": r"licenses:[0-9]+", "licenseask": r"licenseask:[0-9]+", "invalidate": r"invalidate:[a-f0-9]{12}",
     "home": r"home(?::[0-9]+)?", "owner_auth_page": r"owner_auth_page:[0-9]+",
     **{p: p+r":-?[0-9]+" for p in ("g","search","set","alias","addalias","tzlist","export","import","imports")},
     "member": r"member:-?[0-9]+:[0-9]+", "recent": r"recent:-?[0-9]+:[0-9]+(?::[0-9]+)?",
@@ -849,11 +886,13 @@ async def callback(update, context):
     if prefix in ("confirm","cancel","save_setting","cancel_setting"):
         if not pending or data not in (f"confirm:{pending['token']}",f"cancel:{pending['token']}"):
             return await q.answer("按钮已失效，请重新操作 / This button has expired", show_alert=True)
-        role="admin2" if pending["kind"] in ("setting","import") else "admin1"
+        role="owner" if pending["kind"]=="license" else ("admin2" if pending["kind"] in ("setting","import") else "admin1")
         cid=pending["chat_id"]
-        if not await is_admin(update,cid,2 if role=="admin2" else 1):
+        if (role=="owner" and q.from_user.id!=OWNER_ID) or (role!="owner" and not await is_admin(update,cid,2 if role=="admin2" else 1)):
             return await q.answer("权限不足 / Permission denied",show_alert=True)
         # Consume before the next await so double clicks cannot execute twice.
+        if context.user_data.get("pending_token") is not pending:
+            return await q.answer("按钮已失效，请重新操作 / This button has expired",show_alert=True)
         context.user_data.pop("pending_token",None)
         await q.answer()
         if prefix=="cancel":
@@ -863,6 +902,9 @@ async def callback(update, context):
             try: store.set_setting(cid,*payload)
             except ValueError as exc: return await q.edit_message_text(tr_error(cid,str(exc)),reply_markup=back_keyboard(cid))
             return await settings_page(q,cid)
+        if kind=="license":
+            store.revoke_license(payload)
+            return await q.edit_message_text("授权已吊销；该授权下的群组已停用。",reply_markup=back_keyboard(parent="licenses:0"))
         if kind=="import":
             payload,expires=payload
             if expires<=time.time(): return await q.edit_message_text("导入已过期，请重新操作。",reply_markup=back_keyboard(cid))
@@ -936,10 +978,35 @@ async def callback_action(update, context):
         return await q.edit_message_text("请输入要停用的群组 ID 或名称关键词：", reply_markup=back_keyboard(parent="ownerauthorized"))
     if data=="code":
         if uid!=OWNER_ID:return
-        return await q.edit_message_text("新激活码（首次使用后绑定使用者，最多可激活 3 个群）：\n"+store.generate_code(), reply_markup=back_keyboard())
-    if data=="codes":
-        if uid!=OWNER_ID:return
-        rows=store.unused_codes(); return await q.edit_message_text("未使用的激活码记录\n编号 · 创建时间\n"+("\n".join(f"{r['hash']} · {readable_time(r['created_at'])}" for r in rows) if rows else "暂无未使用的激活码。"), reply_markup=back_keyboard())
+        return await q.edit_message_text(f"新激活码（{AUTH_CODE_TTL_DAYS} 天有效，首次使用后绑定使用者，最多同时激活 {MAX_CHATS_PER_LICENSE} 个群）：\n"+store.generate_code(), reply_markup=back_keyboard())
+    if data=="codes" or data.startswith("codes:"):
+        rows=store.unused_codes(); page=int(data.split(":")[1]) if ":" in data else 0
+        pages=max(1,(len(rows)+9)//10); page=min(page,pages-1); visible=rows[page*10:(page+1)*10]
+        body="\n".join(f"{r['hash']} · {readable_time(r['created_at'])} · 到期 {readable_time(r['expires_at']) if r['expires_at'] else '长期有效'}" for r in visible)
+        kb=[[InlineKeyboardButton(f"作废 {r['hash']}",callback_data=f"invalidate:{r['hash']}")] for r in visible]
+        nav=[]
+        if page: nav.append(InlineKeyboardButton("上一页",callback_data=f"codes:{page-1}"))
+        if page+1<pages: nav.append(InlineKeyboardButton("下一页",callback_data=f"codes:{page+1}"))
+        if nav: kb.append(nav)
+        kb.extend(back_keyboard().inline_keyboard)
+        return await q.edit_message_text(f"未使用激活码 {page+1}/{pages}\n"+(body or "暂无有效激活码。"),reply_markup=InlineKeyboardMarkup(kb))
+    if data.startswith("invalidate:"):
+        store.invalidate_code(data.split(":")[1])
+        return await q.edit_message_text("激活码已作废或已不可用。",reply_markup=back_keyboard(parent="codes"))
+    if data.startswith("licenses:"):
+        rows=store.conn.execute("SELECT * FROM licenses ORDER BY bound_at DESC,user_id").fetchall()
+        pages=max(1,(len(rows)+7)//8); page=min(int(data.split(":")[1]),pages-1)
+        kb=[[InlineKeyboardButton(f"{r['user_id']} · {'已吊销' if r['revoked_at'] else '有效'}",callback_data=f"licenseask:{r['user_id']}")] for r in rows[page*8:(page+1)*8]]
+        nav=[]
+        if page: nav.append(InlineKeyboardButton("上一页",callback_data=f"licenses:{page-1}"))
+        if page+1<pages: nav.append(InlineKeyboardButton("下一页",callback_data=f"licenses:{page+1}"))
+        if nav: kb.append(nav)
+        kb.extend(back_keyboard().inline_keyboard)
+        return await q.edit_message_text(f"个人授权 {page+1}/{pages}\n选择授权查看吊销操作。",reply_markup=InlineKeyboardMarkup(kb))
+    if data.startswith("licenseask:"):
+        target=int(data.split(":")[1]); row=store.conn.execute("SELECT * FROM licenses WHERE user_id=?",(target,)).fetchone()
+        if not row or row["revoked_at"]: return await q.edit_message_text("授权不存在或已吊销。",reply_markup=back_keyboard(parent="licenses:0"))
+        return await q.edit_message_text(f"确定吊销用户 {target} 的授权？\n此人的所有群组将停用，且不能再次激活；积分数据保留。",reply_markup=confirmation(context,"license",target,None))
     if data.startswith("g:"):
         cid=int(data[2:]); page=await group_page(update,cid)
         if not page: return await q.edit_message_text("权限已变化，请重新进入。", reply_markup=back_keyboard())
@@ -957,7 +1024,7 @@ async def callback_action(update, context):
     if data.startswith("imports:"):
         cid=int(data[8:]); rows=store.import_history(cid)
         sources={"button": ("管理菜单导入", "Management menu"), "json": ("JSON 数据导入", "JSON import")}
-        body="\n\n".join(tr(cid, f"导入 #{r['id']} · {readable_time(r['imported_at'])}\n操作者：{member_identity(cid, r['operator_id'])}\n导入成员：{r['user_count']} 人\n来源：{sources.get(r['source'], (r['source'], r['source']))[0]}", f"Import #{r['id']} · {readable_time(r['imported_at'])}\nBy: {member_identity(cid, r['operator_id'])}\nMembers imported: {r['user_count']}\nSource: {sources.get(r['source'], (r['source'], r['source']))[1]}") for r in rows) or tr(cid, "本群暂无导入记录。", "No imports for this group yet.")
+        body="\n\n".join(tr(cid, f"导入 #{r['id']} · {readable_time(r['imported_at'])}\n操作者：{list_identity(cid, r['operator_id'])}\n导入成员：{r['user_count']} 人\n来源：{sources.get(r['source'], (r['source'], r['source']))[0]}", f"Import #{r['id']} · {readable_time(r['imported_at'])}\nBy: {list_identity(cid, r['operator_id'])}\nMembers imported: {r['user_count']}\nSource: {sources.get(r['source'], (r['source'], r['source']))[1]}") for r in rows) or tr(cid, "本群暂无导入记录。", "No imports for this group yet.")
         return await q.edit_message_text(tr(cid,"导入记录：\n"+body,"Import history:\n"+body), reply_markup=back_keyboard(cid))
     if data=="home": return await q.edit_message_text("总管理员" if uid==OWNER_ID else "选择群组",reply_markup=owner_home_keyboard() if uid==OWNER_ID else await group_keyboard(update,False))
     if data.startswith("search:"):
