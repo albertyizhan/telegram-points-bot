@@ -11,11 +11,11 @@ from zoneinfo import ZoneInfo
 
 from telegram import (
     BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats,
-    InlineKeyboardButton, InlineKeyboardMarkup, Update,
+    ChatMember, InlineKeyboardButton, InlineKeyboardMarkup, Update,
 )
 from telegram.error import BadRequest
 from telegram.ext import (
-    AIORateLimiter, Application, CallbackQueryHandler, CommandHandler, ContextTypes,
+    AIORateLimiter, Application, ChatMemberHandler, CallbackQueryHandler, CommandHandler, ContextTypes,
     MessageHandler, filters,
 )
 
@@ -118,6 +118,8 @@ class Store:
             CREATE TABLE IF NOT EXISTS aliases(chat_id INTEGER, action TEXT, alias TEXT, PRIMARY KEY(chat_id,alias), FOREIGN KEY(chat_id) REFERENCES chats(chat_id) ON DELETE CASCADE);
             CREATE TABLE IF NOT EXISTS adjustments(id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, operator_id INTEGER, target_id INTEGER, delta INTEGER, before_points INTEGER, after_points INTEGER, method TEXT, created_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS data_imports(id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, operator_id INTEGER NOT NULL, imported_at TEXT NOT NULL, user_count INTEGER NOT NULL DEFAULT 0, source TEXT NOT NULL DEFAULT 'json');
+            CREATE TABLE IF NOT EXISTS chat_departures(chat_id INTEGER PRIMARY KEY, was_enabled INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS chat_migrations(old_id INTEGER PRIMARY KEY, new_id INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS message_fingerprints(chat_id INTEGER,user_id INTEGER,fingerprint TEXT,created_at TEXT NOT NULL,PRIMARY KEY(chat_id,user_id,fingerprint));
             """)
             for table, column, definition in (
@@ -161,6 +163,7 @@ class Store:
                     if not r or r[0]: return False
                     self.conn.execute("INSERT INTO licenses(user_id,code_hash,bound_at) VALUES(?,?,?)", (user_id,h,now()))
                     self.conn.execute("UPDATE auth_codes SET used_at=?,used_by=?,used_chat_id=? WHERE code_hash=? AND used_at IS NULL", (now(),user_id,chat_id,h))
+            self.conn.execute("DELETE FROM chat_departures WHERE chat_id=?", (chat_id,))
             t = now()
             self.conn.execute("INSERT INTO chats(chat_id,title,enabled,created_at,authorized_by) VALUES(?,?,1,?,?) ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title,enabled=1,authorized_by=excluded.authorized_by", (chat_id,title,t,user_id))
             self.conn.execute("INSERT OR IGNORE INTO settings(chat_id) VALUES(?)", (chat_id,))
@@ -181,6 +184,45 @@ class Store:
 
     def revoke(self, chat_id):
         with self.conn: self.conn.execute("UPDATE chats SET enabled=0 WHERE chat_id=?", (chat_id,))
+
+    def migrate_chat(self, old_id, new_id):
+        """Move the whole group atomically; never merge two existing groups."""
+        with db_lock, self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            self.conn.execute("PRAGMA defer_foreign_keys = ON")
+            if not self.conn.execute("SELECT 1 FROM chats WHERE chat_id=?", (old_id,)).fetchone():
+                return False
+            if self.conn.execute("SELECT 1 FROM chats WHERE chat_id=?", (new_id,)).fetchone():
+                raise ValueError(f"群迁移冲突：{old_id} → {new_id}，目标群已有数据")
+            departure = self.conn.execute("SELECT was_enabled FROM chat_departures WHERE chat_id=?", (old_id,)).fetchone()
+            tables = self.conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").fetchall()
+            for row in tables:
+                table = row[0].replace('"', '""')
+                if table in ("chat_migrations", "chat_departures"):
+                    continue
+                columns = self.conn.execute(f'PRAGMA table_info("{table}")').fetchall()
+                for column in columns:
+                    if column[1] in ("chat_id", "used_chat_id"):
+                        name = column[1]
+                        self.conn.execute(f'UPDATE "{table}" SET "{name}"=? WHERE "{name}"=?', (new_id, old_id))
+            if departure:
+                self.conn.execute("UPDATE chats SET enabled=? WHERE chat_id=?", (departure[0], new_id))
+                self.conn.execute("DELETE FROM chat_departures WHERE chat_id=?", (old_id,))
+            self.conn.execute("INSERT INTO chat_migrations(old_id,new_id) VALUES(?,?)", (old_id,new_id))
+            return True
+
+    def bot_removed(self, chat_id):
+        with db_lock, self.conn:
+            if self.conn.execute("SELECT 1 FROM chat_migrations WHERE old_id=?", (chat_id,)).fetchone():
+                return
+            row = self.conn.execute("SELECT enabled FROM chats WHERE chat_id=?", (chat_id,)).fetchone()
+            if row:
+                self.conn.execute("INSERT OR IGNORE INTO chat_departures VALUES(?,?)", (chat_id,row[0]))
+                self.conn.execute("UPDATE chats SET enabled=0 WHERE chat_id=?", (chat_id,))
+
+    def update_title(self, chat_id, title):
+        with self.conn:
+            self.conn.execute("UPDATE chats SET title=? WHERE chat_id=?", (title,chat_id))
 
     def upsert_user(self, chat_id, user_id, username, display_name):
         with self.conn:
@@ -933,6 +975,27 @@ async def private_text(update, context):
     return await update.effective_message.reply_text(tr(cid, "请选择要继续的管理菜单。", "Choose a management menu to continue."), reply_markup=back_keyboard(cid))
 
 
+async def migrate_group(update, context):
+    message = update.effective_message
+    old_id = message.migrate_from_chat_id or update.effective_chat.id
+    new_id = message.migrate_to_chat_id or update.effective_chat.id
+    try:
+        store.migrate_chat(old_id, new_id)
+    except (ValueError, sqlite3.Error) as exc:
+        logging.getLogger(__name__).exception("Group migration failed: %s -> %s", old_id, new_id)
+        if OWNER_ID:
+            await context.bot.send_message(OWNER_ID, f"群组迁移失败，请检查：{old_id} → {new_id}\n{exc}")
+
+
+async def bot_membership(update, context):
+    if update.my_chat_member.new_chat_member.status in (ChatMember.LEFT, ChatMember.BANNED):
+        store.bot_removed(update.effective_chat.id)
+
+
+async def group_title(update, context):
+    store.update_title(update.effective_chat.id, update.effective_message.new_chat_title)
+
+
 async def post_init(application):
     """Register the static commands shown when a user types '/'."""
     try:
@@ -964,6 +1027,9 @@ def build_app(token):
     }
     for command, handler in commands.items():
         app.add_handler(CommandHandler(command, handler, filters=filters.UpdateType.MESSAGE))
+    app.add_handler(ChatMemberHandler(bot_membership, ChatMemberHandler.MY_CHAT_MEMBER))
+    app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & filters.StatusUpdate.MIGRATE, migrate_group))
+    app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & filters.StatusUpdate.NEW_CHAT_TITLE, group_title))
     app.add_handler(CallbackQueryHandler(callback))
     app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & filters.Document.ALL, document_handler))
     app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & filters.TEXT, text_handler))

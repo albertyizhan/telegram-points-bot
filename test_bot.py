@@ -202,6 +202,48 @@ class PointsTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
             self.assertFalse((root / "missing.db").exists())
 
+    def test_migration_all_tables_and_removal_order(self):
+        self.s.upsert_user(-1, 7, "alice", "Alice")
+        self.s.award_chat(-1, 7, "alice", "Alice", "hello")
+        self.s.adjust(-1, 99, 7, 10, "reply")
+        self.s.add_alias(-1, "score", "积分")
+        self.s.import_chat(-1, 99, self.s.export_chat(-1))
+        self.s.bot_removed(-1)
+        self.assertFalse(self.s.authorized(-1))
+        self.assertTrue(self.s.migrate_chat(-1, -1001))
+        self.assertTrue(self.s.authorized(-1001))
+        self.assertEqual(self.s.total(-1001, 7), 11)
+        self.assertEqual(self.s.conn.execute("PRAGMA foreign_key_check").fetchall(), [])
+        for table, column in (("users","chat_id"), ("daily","chat_id"), ("adjustments","chat_id"), ("data_imports","chat_id"), ("aliases","chat_id"), ("auth_codes","used_chat_id")):
+            self.assertEqual(self.s.conn.execute(f"SELECT count(*) FROM {table} WHERE {column}=-1").fetchone()[0], 0)
+            self.assertGreater(self.s.conn.execute(f"SELECT count(*) FROM {table} WHERE {column}=-1001").fetchone()[0], 0)
+        self.assertFalse(self.s.migrate_chat(-1, -1001))
+        self.s.bot_removed(-1)
+        self.assertTrue(self.s.authorized(-1001))
+        self.s.authorize(-2, "two", None, 10)
+        self.s.migrate_chat(-2, -1002)
+        self.s.bot_removed(-2)
+        self.assertTrue(self.s.authorized(-1002))
+        self.s.update_title(-1002, "New title")
+        self.assertEqual(self.s.conn.execute("SELECT title FROM chats WHERE chat_id=-1002").fetchone()[0], "New title")
+        self.s.bot_removed(-1002)
+        self.assertFalse(self.s.authorized(-1002))
+        self.assertTrue(self.s.authorize(-3, "three", None, 10))
+        self.assertTrue(self.s.authorize(-4, "four", None, 10))
+
+    def test_migration_conflict_rolls_back_and_notifies(self):
+        from bot import migrate_group
+        self.s.authorize(-2, "two", None, 10)
+        self.s.upsert_user(-1, 7, None, "Alice")
+        context=SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
+        update=SimpleNamespace(effective_chat=SimpleNamespace(id=-1), effective_message=SimpleNamespace(migrate_from_chat_id=None, migrate_to_chat_id=-2))
+        with patch("bot.store", self.s), patch("bot.OWNER_ID", 99), patch("bot.logging.getLogger"):
+            asyncio.run(migrate_group(update, context))
+        context.bot.send_message.assert_awaited_once()
+        self.assertIsNotNone(self.s.find_user(-1, "7"))
+        self.assertTrue(self.s.authorized(-2))
+        self.assertEqual(self.s.conn.execute("PRAGMA foreign_key_check").fetchall(), [])
+
     def test_private_flows_search_cancel_undo_and_ranking(self):
         self.s.upsert_user(-1, 7, "alice", "Alice")
         self.s.adjust(-1, 99, 7, 10, "reply")
