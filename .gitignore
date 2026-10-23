@@ -4,3 +4,9 @@ points.db*
 .bot.pid
 bot.log
 *.log
+backups/
+*.db
+*.db-wal
+*.db-shm
+__pycache__/
+*.pyc

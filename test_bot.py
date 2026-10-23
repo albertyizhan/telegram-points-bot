@@ -177,6 +177,31 @@ class PointsTests(unittest.TestCase):
             try: self.assertEqual(conn.execute("SELECT total_points FROM users WHERE user_id=7").fetchone()[0], 10)
             finally: conn.close()
 
+    def test_backup_script_uses_env_readonly_and_safe_arguments(self):
+        import pathlib
+        import shutil
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            root=pathlib.Path(tmp)
+            shutil.copy("manage.sh", root / "manage.sh")
+            (root / ".venv/bin").mkdir(parents=True)
+            (root / ".venv/bin/python").symlink_to(os.path.abspath(".venv/bin/python"))
+            db=root / "custom ' database.db"
+            with sqlite3.connect(db) as conn:
+                conn.execute("CREATE TABLE proof(value)")
+                conn.execute("INSERT INTO proof VALUES(42)")
+            (root / ".env").write_text("BOT_TOKEN=fake\nOWNER_ID=1\nDB_PATH=\"custom ' database.db\"\n")
+            dest=root / "backup ' output.db"
+            result=subprocess.run(["bash", str(root / "manage.sh"), "backup", str(dest)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with sqlite3.connect(dest) as conn:
+                self.assertEqual(conn.execute("SELECT value FROM proof").fetchone()[0], 42)
+            self.assertFalse((root / "points.db").exists())
+            (root / ".env").write_text("BOT_TOKEN=fake\nOWNER_ID=1\nDB_PATH=missing.db\n")
+            result=subprocess.run(["bash", str(root / "manage.sh"), "backup"], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1)
+            self.assertFalse((root / "missing.db").exists())
+
     def test_private_flows_search_cancel_undo_and_ranking(self):
         self.s.upsert_user(-1, 7, "alice", "Alice")
         self.s.adjust(-1, 99, 7, 10, "reply")

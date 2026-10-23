@@ -151,8 +151,35 @@ update_bot() {
 
 case "${1:-}" in
   backup)
-    dest="${2:-$ROOT/points-$(date +%Y%m%d-%H%M%S).db}"
-    "$PYTHON" -c "from bot import Store; s=Store(); s.backup(\"$dest\"); s.close()"
+    load_env
+    db="${DB_PATH:-points.db}"
+    [[ -f "$db" ]] || { echo "数据库不存在：$db" >&2; exit 1; }
+    dest="${2:-$ROOT/backups/points-$(date +%Y%m%d-%H%M%S).db}"
+    mkdir -p -- "$(dirname -- "$dest")"
+    "$PYTHON" - "$db" "$dest" "${BACKUP_KEEP:-}" "$ROOT/backups" <<'PYBACKUP'
+import pathlib
+import sqlite3
+import sys
+source, destination, keep, backup_dir = sys.argv[1:]
+if keep and (not keep.isdigit() or int(keep) < 1):
+    raise SystemExit("BACKUP_KEEP 必须是正整数")
+source_path = pathlib.Path(source).resolve()
+if source_path == pathlib.Path(destination).resolve():
+    raise SystemExit("备份目标不能是源数据库")
+with sqlite3.connect(source_path.as_uri() + "?mode=ro", uri=True) as conn:
+    target = sqlite3.connect(destination)
+    try:
+        conn.backup(target)
+    finally:
+        target.close()
+if keep:
+    files = sorted(pathlib.Path(backup_dir).glob("points-????????-??????.db"), key=lambda p: p.name, reverse=True)
+    excess = files[int(keep):]
+    if excess:
+        print("超过保留数量；请手动删除以下旧备份：")
+        for path in excess:
+            print(path)
+PYBACKUP
     echo "备份已创建：$dest";;
 
   start) shift; start_bot "$@";;
