@@ -261,7 +261,7 @@ class PointsTests(unittest.TestCase):
             asyncio.run(callback(update, context))
             self.assertEqual(self.s.total(-1, 7), 10)
             self.assertIn("确认撤销", q.edit_message_text.call_args.args[0])
-            q.data=f"undo_confirm:-1:7:{aid}"
+            q.data=q.edit_message_text.call_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data
             asyncio.run(callback(update, context))
             self.assertEqual(self.s.total(-1, 7), 0)
             q.data="stat:-1:0"
@@ -269,6 +269,34 @@ class PointsTests(unittest.TestCase):
             asyncio.run(callback(update, context))
             markup=q.edit_message_text.call_args.kwargs["reply_markup"]
             self.assertIn("rank:-1:0:0", [b.callback_data for row in markup.inline_keyboard for b in row])
+
+    def test_callback_tokens_permissions_and_invalid_data(self):
+        from bot import confirmation, CALLBACK_ROUTES, owner_home_keyboard
+        self.s.upsert_user(-1, 7, "alice", "Alice")
+        user=SimpleNamespace(id=99, username="admin", full_name="Admin")
+        q=SimpleNamespace(data="",from_user=user,answer=AsyncMock(),edit_message_text=AsyncMock())
+        update=SimpleNamespace(callback_query=q,effective_chat=SimpleNamespace(type="private"),effective_user=user)
+        context=SimpleNamespace(user_data={})
+        with patch("bot.store",self.s), patch("bot.is_admin",new=AsyncMock(return_value=True)):
+            old=confirmation(context,"adjust",(7,10,""),-1).inline_keyboard[0][0].callback_data
+            current=confirmation(context,"adjust",(7,5,""),-1).inline_keyboard[0][0].callback_data
+            q.data=old; asyncio.run(callback(update,context))
+            self.assertEqual(self.s.total(-1,7),0)
+            q.data=current; asyncio.run(callback(update,context)); asyncio.run(callback(update,context))
+            self.assertEqual(self.s.total(-1,7),5)
+            for data in ("confirm","save_setting","cancel_setting","???","rank:abc:0:0","edit:-1:missing","g:1:2","rank:-1:8:0", "tz:-1:garbage"):
+                q.data=data; asyncio.run(callback(update,context))
+            for row in owner_home_keyboard().inline_keyboard:
+                for button in row: self.assertIn(button.callback_data.split(":")[0],CALLBACK_ROUTES)
+        q.data="export:-1"
+        with patch("bot.store",self.s),patch("bot.is_admin",new=AsyncMock(return_value=False)) as check:
+            asyncio.run(callback(update,context))
+            check.assert_awaited_once_with(update,-1,2)
+        q.data="rank:-1:0:0"
+        update.get_bot=lambda: SimpleNamespace(get_chat_member=AsyncMock(return_value=SimpleNamespace(status="left")))
+        with patch("bot.store",self.s):
+            asyncio.run(callback(update,context))
+            self.assertIn("Members only",q.answer.call_args.args[0])
 
     def test_document_without_filename_has_recovery_buttons(self):
         message=SimpleNamespace(document=SimpleNamespace(file_name=None), reply_text=AsyncMock())

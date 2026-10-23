@@ -1,3 +1,4 @@
+import time
 import logging
 import hashlib
 import os
@@ -439,15 +440,23 @@ class Store:
 store = Store()
 
 
+_admin_cache = {}
+
+
 async def admin_level(update, chat_id=None):
     uid=update.effective_user.id; chat_id=chat_id or update.effective_chat.id
     if uid == OWNER_ID: return 3
+    key=(chat_id,uid)
+    cached=_admin_cache.get(key)
+    if cached and cached[0] > time.monotonic(): return cached[1]
+    level=0
     try:
         member = await update.get_bot().get_chat_member(chat_id,uid)
-        if member.status == "creator": return 3
-        if member.status == "administrator": return 2 if member.can_promote_members else 1
-    except Exception: pass
-    return 0
+        if member.status == "creator": level=3
+        elif member.status == "administrator": level=2 if member.can_promote_members else 1
+    except Exception: return 0
+    _admin_cache[key]=(time.monotonic()+60,level)
+    return level
 
 
 async def is_admin(update, chat_id=None, minimum=1):
@@ -690,7 +699,7 @@ def back_keyboard(cid=None, parent=None, zh="返回上级菜单", en="Back"):
 
 
 def clear_management_input(context):
-    for key in ("state", "edit", "custom", "reason_pending", "pending", "pending_setting"):
+    for key in ("state", "edit", "custom", "reason_pending", "pending", "pending_setting", "pending_token", "awaiting_import"):
         context.user_data.pop(key, None)
 
 
@@ -716,22 +725,101 @@ async def group_page(update, chat_id):
     return label(f"{chat['title']}\n群组积分管理\n每日重置时区：{s['timezone']}", f"{chat['title']}\nGroup point management\nDaily reset timezone: {s['timezone']}"), InlineKeyboardMarkup(kb)
 
 
+# Prefix -> (required role, route). Parsing is centralized before dispatch.
+CALLBACK_ROLES = {
+    **{p: "public" for p in ("noop", "home")},
+    **{p: "owner" for p in ("ownergroups", "ownerauthorized", "owner_auth_page", "ownersearch", "ownersearch_auth", "code", "codes", "revokeask", "revokeyes")},
+    **{p: "admin1" for p in ("g", "search", "member", "adjust", "recent", "undo_recent", "undo_confirm", "stat", "custom")},
+    **{p: "admin2" for p in ("set", "edit", "alias", "addalias", "delalias", "lang", "tz", "tzlist", "export", "import", "imports")},
+    "rank": "member", "confirm": "pending", "cancel": "pending",
+}
+CALLBACK_PATTERNS = {
+    "home": r"home(?::[0-9]+)?", "owner_auth_page": r"owner_auth_page:[0-9]+",
+    **{p: p+r":-?[0-9]+" for p in ("g","search","set","alias","addalias","tzlist","export","import","imports")},
+    "member": r"member:-?[0-9]+:[0-9]+", "recent": r"recent:-?[0-9]+:[0-9]+(?::[0-9]+)?",
+    **{p: p+r":-?[0-9]+:[0-9]+:[0-9]+" for p in ("undo_recent","undo_confirm")},
+    "adjust": r"adjust:-?[0-9]+:[0-9]+:-?[0-9]+", "custom": r"custom:-?[0-9]+:[0-9]+:-?1",
+    "stat": r"stat:-?[0-9]+:[01]", "rank": r"rank:-?[0-9]+:[01]:[0-9]+",
+    "edit": r"edit:-?[0-9]+:(min_chars|daily_limit|checkin_points)",
+    "lang": r"lang:-?[0-9]+:(zh|en|toggle)", "tz": r"tz:-?[0-9]+:.+",
+    "delalias": r"delalias:-?[0-9]+:.+",
+    **{p: p+r":-?[0-9]+(?::(?:owner|group))?" for p in ("revokeask","revokeyes")},
+    "confirm": r"confirm:[a-f0-9]{8}", "cancel": r"cancel:[a-f0-9]{8}",
+}
+
+
+def confirmation(context, kind, payload, cid):
+    clear_management_input(context)
+    token=secrets.token_hex(4)
+    context.user_data["pending_token"]={"token": token, "kind": kind, "payload": payload, "chat_id": cid}
+    return InlineKeyboardMarkup([[InlineKeyboardButton(tr(cid,"确认","Confirm"),callback_data=f"confirm:{token}"), InlineKeyboardButton(tr(cid,"取消","Cancel"),callback_data=f"cancel:{token}")]])
+
+
 async def callback(update, context):
-    q=update.callback_query; await q.answer(); uid=q.from_user.id; data=q.data
+    q=update.callback_query
+    data=q.data
+    prefix=data.split(":",1)[0] if isinstance(data,str) else ""
+    pending=context.user_data.get("pending_token")
+    if prefix in ("confirm","cancel","save_setting","cancel_setting"):
+        if not pending or data not in (f"confirm:{pending['token']}",f"cancel:{pending['token']}"):
+            return await q.answer("按钮已失效，请重新操作 / This button has expired", show_alert=True)
+        role="admin2" if pending["kind"]=="setting" else "admin1"
+        cid=pending["chat_id"]
+        if not await is_admin(update,cid,2 if role=="admin2" else 1):
+            return await q.answer("权限不足 / Permission denied",show_alert=True)
+        # Consume before the next await so double clicks cannot execute twice.
+        context.user_data.pop("pending_token",None)
+        await q.answer()
+        if prefix=="cancel":
+            return await q.edit_message_text(tr(cid,"已取消操作。","Operation cancelled."),reply_markup=back_keyboard(cid))
+        kind=pending["kind"]; payload=pending["payload"]
+        if kind=="setting":
+            try: store.set_setting(cid,*payload)
+            except ValueError as exc: return await q.edit_message_text(tr_error(cid,str(exc)),reply_markup=back_keyboard(cid))
+            return await settings_page(q,cid)
+        if kind=="undo":
+            us,aid=payload
+            try: store.undo_adjustment(cid,q.from_user.id,aid)
+            except ValueError as exc: return await q.edit_message_text(str(exc),reply_markup=back_keyboard(cid))
+            return await member_page(q,context,cid,us,tr(cid,"已撤销记录。","Entry undone."))
+        if kind=="adjust":
+            tid,delta,reason=payload
+            store.upsert_user(cid,q.from_user.id,q.from_user.username,q.from_user.full_name)
+            try: before,after=store.adjust(cid,q.from_user.id,tid,delta,"后台",reason)
+            except ValueError as exc: return await q.edit_message_text(tr_error(cid,str(exc)),reply_markup=back_keyboard(cid))
+            return await member_page(q,context,cid,tid,tr(cid,f"已调整：{before} → {after}",f"Updated: {before} → {after}"))
+    route=CALLBACK_ROUTES.get(prefix)
+    if not route or not re.fullmatch(CALLBACK_PATTERNS.get(prefix,re.escape(prefix)),data):
+        return await q.answer("无效操作 / Invalid operation",show_alert=True)
+    role,handler=route
+    if role=="owner" and q.from_user.id!=OWNER_ID:
+        return await q.answer("权限不足 / Permission denied",show_alert=True)
+    if role in ("admin1","admin2","member"):
+        cid=int(data.split(":")[1])
+        if not store.settings(cid): return await q.answer("无效操作 / Invalid operation",show_alert=True)
+        if role=="member":
+            if update.effective_chat.type!="private":
+                if update.effective_chat.id!=cid: return await q.answer("无效操作 / Invalid operation",show_alert=True)
+            else:
+                try:
+                    member=await update.get_bot().get_chat_member(cid,q.from_user.id)
+                    allowed=member.status in ("member","administrator","creator") or (member.status=="restricted" and member.is_member)
+                except Exception: allowed=False
+                if not allowed: return await q.answer("仅群成员可查看 / Members only",show_alert=True)
+        elif not await is_admin(update,cid,2 if role=="admin2" else 1):
+            return await q.answer("权限不足 / Permission denied",show_alert=True)
+        if update.effective_chat.type=="private": context.user_data["chat_id"]=cid
+    clear_management_input(context)
+    await q.answer()
+    try:
+        return await handler(update,context)
+    except (ValueError, KeyError, TypeError, IndexError, OverflowError):
+        return await q.answer("无效操作 / Invalid operation",show_alert=True)
+
+
+async def callback_action(update, context):
+    q=update.callback_query; uid=q.from_user.id; data=q.data
     if data=="noop": return
-    if data not in ("confirm", "save_setting", "cancel_setting"):
-        clear_management_input(context)
-    protected=("g:","search:","member:","adjust:","recent:","undo_recent:","undo_confirm:","stat:","set:","edit:","alias:","addalias:","delalias:","custom:","lang:","tz:","tzlist:","export:","import:","imports:")
-    if uid != OWNER_ID and data.startswith(protected):
-        # callback data is prefix:chat_id:..., and Telegram group IDs are negative.
-        try: protected_chat=int(data.split(":")[1])
-        except (ValueError, IndexError): return await q.edit_message_text("无效操作。", reply_markup=back_keyboard())
-        required = 2 if data.startswith(("set:","edit:","alias:","addalias:","delalias:","lang:","tz:","tzlist:")) else 1
-        if not await is_admin(update, protected_chat, required):
-            parent = f"g:{protected_chat}" if await is_admin(update, protected_chat) else "home:0"
-            return await q.edit_message_text("权限不足或权限已变化，操作取消。", reply_markup=back_keyboard(parent=parent))
-    if data.startswith(protected) and update.effective_chat.type == "private":
-        context.user_data["chat_id"] = int(data.split(":")[1])
     if data.startswith("home:"):
         return await q.edit_message_text("选择群组",reply_markup=await group_keyboard(update,uid==OWNER_ID,int(data.split(":",1)[1])))
     if data == "ownergroups":
@@ -783,18 +871,11 @@ async def callback(update, context):
         if uid!=OWNER_ID and not await is_admin(update,cs): return await q.edit_message_text("权限已变化，请重新进入。")
         return await member_page(q,context,cs,us)
     if data.startswith("adjust:"):
-        _,cs,us,delta=data.split(":"); delta=int(delta); cs=int(cs); us=int(us); context.user_data["pending"]=(cs,us,delta,""); u=store.find_user(cs,us); chat=store.conn.execute("SELECT title FROM chats WHERE chat_id=?",(cs,)).fetchone(); title=chat[0] if chat else str(cs); english=store.settings(cs)["language"] == "en"
-        confirm=adjustment_summary(cs, us, delta)
-        return await q.edit_message_text(confirm,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Confirm" if english else "确认",callback_data="confirm"),InlineKeyboardButton("Cancel" if english else "取消",callback_data=f"member:{cs}:{us}")]]))
-    if data=="confirm":
-        p=context.user_data.pop("pending",None)
-        if not p:return await q.edit_message_text("该操作已处理或取消。", reply_markup=back_keyboard(context.user_data.get("chat_id")))
-        cid,tid,delta,reason=(p+("",))[:4]
-        if uid!=OWNER_ID and not await is_admin(update,cid): return await q.edit_message_text("权限已变化，操作取消。", reply_markup=back_keyboard())
-        store.upsert_user(cid, uid, q.from_user.username, q.from_user.full_name)
-        try: before,after=store.adjust(cid,uid,tid,delta,"后台",reason)
-        except ValueError as e:return await q.edit_message_text(tr_error(cid, str(e)), reply_markup=back_keyboard(cid, f"member:{cid}:{tid}", "返回成员积分", "Back to member"))
-        return await member_page(q,context,cid,tid,tr(cid,f"已调整：{before} -> {after}",f"Updated: {before} -> {after}"))
+        _,cs,us,delta=data.split(":"); cs=int(cs); us=int(us); delta=int(delta)
+        if not store.find_user(cs,us) or not 1<=abs(delta)<=1000000:
+            return await q.edit_message_text("无效操作",reply_markup=back_keyboard(cs))
+        markup=confirmation(context,"adjust",(us,delta,""),cs)
+        return await q.edit_message_text(adjustment_summary(cs,us,delta),reply_markup=markup)
     if data.startswith("recent:"):
         parts=data.split(":"); cs=int(parts[1]); us=int(parts[2]); page=int(parts[3]) if len(parts)>3 else 0
         rows=store.recent(cs, us, page, 5)
@@ -808,18 +889,10 @@ async def callback(update, context):
         _,cs,us,aid=data.split(":"); cs=int(cs); us=int(us); aid=int(aid)
         row=store.conn.execute("SELECT * FROM adjustments WHERE id=? AND chat_id=? AND target_id=?", (aid,cs,us)).fetchone()
         if not row: return await q.edit_message_text("找不到该调整记录。", reply_markup=back_keyboard(cs))
-        return await q.edit_message_text(tr(cs, f"确认撤销记录 #{aid}？\n成员：{member_identity(cs, us)}\n本次将调整：{-row['delta']:+d} 分\n其他积分变动保持不变。", f"Undo entry #{aid}?\nMember: {member_identity(cs, us)}\nChange: {-row['delta']:+d} points\nOther point changes are preserved."), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(tr(cs,"确认撤销","Confirm undo"),callback_data=f"undo_confirm:{cs}:{us}:{aid}"),InlineKeyboardButton(tr(cs,"取消","Cancel"),callback_data=f"recent:{cs}:{us}")]]))
+        markup=confirmation(context,"undo",(us,aid),cs)
+        return await q.edit_message_text(tr(cs,f"确认撤销记录 #{aid}？\n本次将调整：{-row['delta']:+d} 分",f"Undo entry #{aid}?\nChange: {-row['delta']:+d} points"),reply_markup=markup)
     if data.startswith("undo_confirm:"):
-        _,cs,us,aid=data.split(":"); cs=int(cs); us=int(us); aid=int(aid)
-        row=store.conn.execute("SELECT target_id,delta FROM adjustments WHERE id=? AND chat_id=?", (aid, cs)).fetchone()
-        if not row or row["target_id"] != us:
-            return await q.edit_message_text(tr(cs, "找不到这条调整记录。", "Adjustment record not found."), reply_markup=back_keyboard(cs, f"recent:{cs}:{us}", "返回调整记录", "Back to history"))
-        store.upsert_user(cs, uid, q.from_user.username, q.from_user.full_name)
-        try:
-            store.undo_adjustment(cs, uid, aid)
-        except ValueError as e:
-            return await q.edit_message_text(tr_error(cs, str(e)), reply_markup=back_keyboard(cs, f"recent:{cs}:{us}", "返回调整记录", "Back to history"))
-        return await member_page(q, context, cs, us, tr(cs, f"已撤销记录 #{aid}。", f"Entry #{aid} undone."))
+        return await q.answer("按钮已失效，请重新操作 / This button has expired",show_alert=True)
     if data.startswith("stat:"):
         _,cs,today_flag=data.split(":"); cs=int(cs); rows,total=store.ranking(cs,today_flag=="1",0,15)
         title=tr(cs, "今日积分排名" if today_flag=="1" else "累计积分排名", "Today's ranking" if today_flag=="1" else "All-time ranking")
@@ -853,21 +926,6 @@ async def callback(update, context):
         _,cs,key=data.split(":"); cs=int(cs); context.user_data["state"]="setting"; context.user_data["edit"]=(cs,key); context.user_data["chat_id"]=cs
         zero = {"min_chars": ("0 表示不限制消息长度", "0 means no minimum length"), "daily_limit": ("0 表示不限制每日聊天积分", "0 means unlimited daily chat points"), "checkin_points": ("0 表示签到不奖励积分", "0 means no check-in reward")}[key]
         return await q.edit_message_text(tr(cs, f"{SETTING_LABELS[key][0]}\n请输入 0 到 1000000 的整数，{zero[0]}。", f"{SETTING_LABELS[key][1]}\nEnter an integer from 0 to 1,000,000; {zero[1]}."), reply_markup=back_keyboard(cs, f"set:{cs}", "返回积分规则", "Back to rules"))
-    if data=="save_setting":
-        p=context.user_data.pop("pending_setting",None)
-        if not p:return await q.edit_message_text("该设置已处理或取消。", reply_markup=back_keyboard(context.user_data.get("chat_id")))
-        cs,key,value=p
-        if uid!=OWNER_ID and not await is_admin(update,cs,2): return await q.edit_message_text("权限不足或权限已变化，操作取消。", reply_markup=back_keyboard())
-        try:
-            store.set_setting(cs,key,value)
-        except ValueError as e:
-            return await q.edit_message_text(tr_error(cs, str(e)), reply_markup=back_keyboard(cs, f"set:{cs}", "返回积分规则", "Back to rules"))
-        english=store.settings(cs)["language"] == "en"; return await q.edit_message_text("Settings saved." if english else "设置已保存。",reply_markup=back_keyboard(cs, f"set:{cs}", "继续修改积分规则", "Continue editing rules"))
-    if data=="cancel_setting":
-        p=context.user_data.pop("pending_setting",None)
-        cs=p[0] if p else context.user_data.get("chat_id")
-        clear_management_input(context)
-        return await q.edit_message_text(tr(cs, "已取消修改。", "Change cancelled."), reply_markup=back_keyboard(cs, f"set:{cs}" if cs else None, "返回积分规则", "Back to rules"))
     if data.startswith("alias:"):
         cid=int(data[6:]); ars=store.aliases(cid); english=store.settings(cid)["language"] == "en"; kb=[[InlineKeyboardButton((f"Remove shortcut {r['alias']}" if english else f"删除快捷名称 {r['alias']}"),callback_data=f"delalias:{cid}:{r['alias']}")] for r in ars]
         kb.append([InlineKeyboardButton("Add a command shortcut" if english else "添加自定义命令名称",callback_data=f"addalias:{cid}"),InlineKeyboardButton("Back to group" if english else "返回群组",callback_data=f"g:{cid}")])
@@ -893,6 +951,9 @@ async def callback(update, context):
         return await q.edit_message_text("Group points deactivated." if english else "群组积分功能已停用。",reply_markup=owner_authorized_keyboard(0) if owner_list else await group_keyboard(update,True))
     if data.startswith("custom:"):
         _,cs,us,sign=data.split(":"); cs=int(cs); context.user_data["state"]="custom"; context.user_data["custom"]=(cs,int(us),int(sign)); return await q.edit_message_text(tr(cs,"请输入调整数量（1-1000000）：","Enter an amount (1-1,000,000):"), reply_markup=back_keyboard(cs, f"member:{cs}:{us}", "返回成员积分", "Back to member"))
+
+
+CALLBACK_ROUTES = {prefix: (role, callback_action) for prefix,role in CALLBACK_ROLES.items()}
 
 
 async def member_page(q, context, cid, uid, notice=""):
@@ -954,16 +1015,18 @@ async def private_text(update, context):
         return await update.effective_message.reply_text(tr(cid, f"{member_identity(cid, u['user_id'])}\n总积分：{u['total_points']} 分", f"{member_identity(cid, u['user_id'])}\nTotal points: {u['total_points']}"),reply_markup=InlineKeyboardMarkup(rows))
     if state=="setting":
         if not text.isdigit():return await update.effective_message.reply_text(tr(cid,"请输入非负整数。","Enter a non-negative integer."), reply_markup=back_keyboard(cid, f"set:{cid}", "返回积分规则", "Back to rules"))
-        cs,key=context.user_data.pop("edit"); context.user_data.pop("state",None); context.user_data["pending_setting"]=(cs,key,int(text)); old=store.settings(cs)[key]
-        label=SETTING_LABELS[key][1 if store.settings(cs)["language"] == "en" else 0]
-        english=store.settings(cs)["language"] == "en"; return await update.effective_message.reply_text(f"{'Confirm' if english else '确认修改'} {label}: {old} -> {int(text)}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Confirm" if english else "确认",callback_data="save_setting"),InlineKeyboardButton("Cancel" if english else "取消",callback_data="cancel_setting")]]))
+        cs,key=context.user_data["edit"]; value=int(text); old=store.settings(cs)[key]
+        if value>1000000: return await update.effective_message.reply_text(tr_error(cs,"设置必须是 0 到 1000000 的整数"),reply_markup=back_keyboard(cs))
+        markup=confirmation(context,"setting",(key,value),cs)
+        return await update.effective_message.reply_text(f"{SETTING_LABELS[key][0]}: {old} → {value}",reply_markup=markup)
     if state=="alias":
         p=text.split(None,1)
         if len(p)!=2 or not store.add_alias(cid,p[0].lower(),p[1]):return await update.effective_message.reply_text(tr(cid,"格式错误或别名冲突，请使用：score /points","Invalid format or conflicting alias. Example: score /points"), reply_markup=back_keyboard(cid, f"alias:{cid}", "返回自定义命令", "Back to custom commands"))
         context.user_data.pop("state",None); return await update.effective_message.reply_text(tr(cid,"自定义命令已保存。","Custom command saved."),reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back to custom commands" if store.settings(cid)["language"] == "en" else "返回自定义命令",callback_data=f"alias:{cid}")]]))
     if state=="reason":
-        cs,us,delta=context.user_data.pop("reason_pending"); context.user_data.pop("state",None); context.user_data["pending"]=(cs,us,delta,text[:200])
-        return await update.effective_message.reply_text(adjustment_summary(cs, us, delta, text[:200]),reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(tr(cs, "确认调整", "Confirm adjustment"),callback_data="confirm"), InlineKeyboardButton(tr(cs, "取消", "Cancel"), callback_data=f"member:{cs}:{us}")]]))
+        cs,us,delta=context.user_data["reason_pending"]
+        markup=confirmation(context,"adjust",(us,delta,text[:200]),cs)
+        return await update.effective_message.reply_text(adjustment_summary(cs,us,delta,text[:200]),reply_markup=markup)
     if state=="custom":
         if not text.isdigit() or not 1<=int(text)<=1000000:
             cs,us,_=context.user_data["custom"]
